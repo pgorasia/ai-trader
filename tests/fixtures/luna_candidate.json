@@ -1,0 +1,28 @@
+{
+  "cycle_id": "2026-08-14-cycle-1",
+  "timestamp": "2026-08-14T10:00:05-04:00",
+  "scanner_total": 1,
+  "symbols_processed": ["TEST"],
+  "finalists": [{
+    "symbol": "TEST",
+    "classification": "NEW",
+    "scanner_percent_change": 0.05,
+    "rvol": 1.8,
+    "gap_return": 0.01,
+    "intraday_return": 0.04,
+    "distance_from_high": 0.002,
+    "distance_from_vwap": 0.015,
+    "vwap": 9.85,
+    "rsi14": 66.0,
+    "ema20": 9.92,
+    "volume_persistence": 1.7,
+    "technical_reason": "Completed base breakout on persistent volume.",
+    "material_requalification": null,
+    "completed_15m_structure": []
+  }],
+  "security_status": {"robinhood_mcp_available": true, "boundary_ok": true, "forbidden_tools_available": []},
+  "account_status": {"agentic_account_count": 1, "reconciled": true, "account_equity": 100.0, "buying_power": 100.0, "unexpected_positions": 0, "unexpected_orders": 0},
+  "tool_call_count": {"total": 12, "run_scan": 1},
+  "errors": [],
+  "sol_escalation": true
+}

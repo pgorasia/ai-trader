@@ -1,0 +1,57 @@
+mode: SHADOW
+timezone: America/New_York
+exchange_calendar: XNYS
+
+scanner:
+  name: AI-DayTrader-V1
+  id: c4646257-9c99-4e35-801b-80f8b83b81ea
+  maximum_results: 20
+  sort_column: "% Change"
+  sort_direction: desc
+
+models:
+  luna: gpt-5.6-luna
+  sol: gpt-5.6-sol
+  sol_reasoning_effort: high
+
+codex:
+  executable: codex
+  timeout_seconds: 240
+  transient_read_retries: 1
+  retry_backoff_seconds: 2
+  sandbox: read-only
+
+schedule:
+  no_entry_before: "09:40"
+  morning_end: "11:00"
+  midday_end: "14:00"
+  late_selectivity_start: "15:20"
+  latest_entry: "15:40"
+  mandatory_flat: "15:55"
+  eod_offset_minutes: 5
+  full_session_close: "16:00"
+  morning_interval_minutes: 10
+  midday_interval_minutes: 25
+  afternoon_interval_minutes: 10
+
+risk:
+  reference_capital: 100.0
+  maximum_hypothetical_notional: 35.0
+  maximum_planned_loss: 1.0
+  maximum_account_risk_percent: 1.0
+  minimum_reward_risk: 1.9
+  maximum_concurrent_shadow_positions: 1
+  direction: LONG_ONLY
+
+cooldown:
+  senior_rejection_minutes: 30
+
+readiness:
+  minimum_market_sessions: 10
+  minimum_completed_shadow_trades: 20
+  estimated_round_trip_cost_bps: 20
+  minimum_profit_factor: 1.0
+  maximum_single_winner_gross_profit_fraction: 0.50
+  maximum_drawdown_dollars: 5.0
+  maximum_security_violations: 0
+  maximum_unresolved_state_failures: 0

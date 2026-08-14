@@ -1,0 +1,9 @@
+{
+  "decision": "NO_TRADE",
+  "decision_timestamp": "2026-08-14T10:03:00-04:00",
+  "evaluated_symbols": ["TEST"],
+  "rejections": [{"symbol": "TEST", "reason": "No objective two-to-one target after extension.", "rejection_categories": ["EXTENSION", "INADEQUATE_REWARD_RISK"]}],
+  "robinhood_tool_call_count": 10,
+  "web_search_count": 2,
+  "errors": []
+}

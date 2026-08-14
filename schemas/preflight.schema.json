@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Read-only Shadow preflight",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["timestamp", "robinhood_mcp_available", "available_robinhood_tools", "forbidden_tools_available", "agentic_account_count", "account_reconciled", "account_equity", "buying_power", "unexpected_equity_positions", "unexpected_equity_orders", "tool_call_count", "errors"],
+  "properties": {
+    "timestamp": {"type": "string", "format": "date-time"},
+    "robinhood_mcp_available": {"type": "boolean"},
+    "available_robinhood_tools": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "forbidden_tools_available": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "agentic_account_count": {"type": "integer", "minimum": 0},
+    "account_reconciled": {"type": "boolean"},
+    "account_equity": {"type": ["number", "null"], "minimum": 0},
+    "buying_power": {"type": ["number", "null"], "minimum": 0},
+    "unexpected_equity_positions": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["symbol", "quantity"],
+        "properties": {"symbol": {"type": "string", "pattern": "^[A-Z.\\-]{1,10}$"}, "quantity": {"type": "number"}}
+      }
+    },
+    "unexpected_equity_orders": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["symbol", "state", "side"],
+        "properties": {"symbol": {"type": "string", "pattern": "^[A-Z.\\-]{1,10}$"}, "state": {"type": "string"}, "side": {"type": "string"}}
+      }
+    },
+    "tool_call_count": {"type": "integer", "minimum": 0},
+    "errors": {"type": "array", "items": {"type": "string"}}
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sol senior Shadow decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision", "decision_timestamp", "evaluated_symbols", "rejections", "robinhood_tool_call_count", "web_search_count", "errors"],
+  "properties": {
+    "decision": {"enum": ["NO_TRADE", "SHADOW_TRADE_PLAN"]},
+    "decision_timestamp": {"type": "string", "format": "date-time"},
+    "evaluated_symbols": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Z.\\-]{1,10}$"}},
+    "rejections": {
+      "type": "array", "maxItems": 3,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["symbol", "reason", "rejection_categories"],
+        "properties": {
+          "symbol": {"type": "string", "pattern": "^[A-Z.\\-]{1,10}$"},
+          "reason": {"type": "string", "minLength": 1},
+          "rejection_categories": {"type": "array", "minItems": 1, "items": {"enum": ["EXTENSION", "NO_OBJECTIVE_ENTRY", "INADEQUATE_REWARD_RISK", "VOLUME", "MARKET_REGIME", "CATALYST", "EVENT_RISK", "LIQUIDITY", "TIME_REMAINING", "DATA_QUALITY", "INELIGIBLE_INSTRUMENT", "OTHER"]}}
+        }
+      }
+    },
+    "symbol": {"type": "string", "pattern": "^[A-Z.\\-]{1,10}$"},
+    "current_price": {"type": "number", "exclusiveMinimum": 0},
+    "catalyst": {"type": "string"},
+    "catalyst_classification": {"enum": ["VERIFIED_FRESH", "RECENT_BUT_STALE", "STALE", "IMMINENT_EVENT_RISK", "UNIDENTIFIED", "NONE_REQUIRED_TECHNICAL"]},
+    "market_regime": {"enum": ["TRENDING_BULLISH", "TRENDING_BEARISH", "RANGE_OR_CHOP", "HIGH_VOLATILITY_EVENT", "UNCERTAIN"]},
+    "setup_type": {"type": "string", "minLength": 1},
+    "entry_trigger": {"type": "number", "exclusiveMinimum": 0},
+    "entry_trigger_type": {"enum": ["TRADE_AT_OR_ABOVE", "COMPLETED_5M_CLOSE_AT_OR_ABOVE"]},
+    "entry_condition": {"type": "string", "minLength": 1},
+    "maximum_chase_price": {"type": "number", "exclusiveMinimum": 0},
+    "stop_price": {"type": "number", "exclusiveMinimum": 0},
+    "stop_basis": {"type": "string", "minLength": 1},
+    "target1": {"type": "number", "exclusiveMinimum": 0},
+    "target2_optional": {"type": ["number", "null"], "exclusiveMinimum": 0},
+    "hypothetical_notional": {"type": "number", "exclusiveMinimum": 0, "maximum": 35},
+    "hypothetical_quantity": {"type": "number", "exclusiveMinimum": 0},
+    "planned_dollar_risk": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+    "planned_account_risk_percent": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+    "reward_risk_target1": {"type": "number", "minimum": 1.9},
+    "invalidation_condition": {"type": "string", "minLength": 1},
+    "time_exit": {"type": "string", "format": "date-time"},
+    "latest_entry_time": {"type": "string", "format": "date-time"},
+    "mandatory_flat_time": {"type": "string", "format": "date-time"},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "robinhood_tool_call_count": {"type": "integer", "minimum": 0},
+    "web_search_count": {"type": "integer", "minimum": 0},
+    "errors": {"type": "array", "items": {"type": "string"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"decision": {"const": "SHADOW_TRADE_PLAN"}}, "required": ["decision"]},
+      "then": {"required": ["symbol", "current_price", "catalyst", "catalyst_classification", "market_regime", "setup_type", "entry_trigger", "entry_trigger_type", "entry_condition", "maximum_chase_price", "stop_price", "stop_basis", "target1", "target2_optional", "hypothetical_notional", "hypothetical_quantity", "planned_dollar_risk", "planned_account_risk_percent", "reward_risk_target1", "invalidation_condition", "time_exit", "latest_entry_time", "mandatory_flat_time", "confidence"]}
+    }
+  ]
+}
