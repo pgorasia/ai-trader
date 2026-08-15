@@ -101,7 +101,7 @@ class ShadowMonitorTests(unittest.TestCase):
 
     def test_original_plan_is_never_modified(self):
         original = deepcopy(self.record["original_plan"])
-        self.monitor.evaluate(self.record, [bar("2026-08-14T10:05:00-04:00", 9.8, 10.2, 9.7, 10.1)])
+        self.monitor.evaluate(self.record, [bar("2026-08-14T10:05:00-04:00", 9.8, 10.2, 9.7, 10.1)], datetime.fromisoformat("2026-08-14T10:10:00-04:00"))
         self.assertEqual(self.record["original_plan"], original)
 
     def test_resumed_open_plan_does_not_replay_pre_entry_bars(self):
@@ -121,7 +121,7 @@ class ShadowMonitorTests(unittest.TestCase):
     def test_completed_close_entry_ignores_same_bar_prior_extremes(self):
         record = deepcopy(self.record)
         record["original_plan"]["entry_trigger_type"] = "COMPLETED_5M_CLOSE_AT_OR_ABOVE"
-        bars = [bar("2026-08-14T10:05:00-04:00", 9.4, 11.2, 9.0, 10.05)]
+        bars = [bar("2026-08-14T10:05:00-04:00", 9.4, 11.2, 9.0, 10.0)]
         result = self.monitor.evaluate(record, bars, datetime.fromisoformat("2026-08-14T10:10:00-04:00"))
         self.assertEqual(result["outcome"]["status"], "OPEN")
         self.assertEqual(result["outcome"]["mfe"], 0.0)
@@ -138,6 +138,39 @@ class ShadowMonitorTests(unittest.TestCase):
         result = self.monitor.evaluate(record, bars, datetime.fromisoformat("2026-08-14T16:00:00-04:00"))
         self.assertEqual(result["outcome"]["status"], "FLAT_TIME")
         self.assertEqual(result["outcome"]["exit_price"], 10.2)
+
+    def test_fixed_and_trailing_variants_share_the_exact_entry(self):
+        bars = [bar("2026-08-14T10:05:00-04:00", 9.8, 10.2, 9.7, 10.1)]
+        fixed = self.monitor.evaluate(self.record, bars, datetime.fromisoformat("2026-08-14T10:10:00-04:00"))
+        paired = self.monitor.evaluate_trailing(fixed, bars, datetime.fromisoformat("2026-08-14T10:10:00-04:00"))
+        self.assertEqual(paired["outcome"]["entry_timestamp"], paired["trailing_outcome"]["entry_timestamp"])
+        self.assertEqual(paired["outcome"]["entry_price"], paired["trailing_outcome"]["entry_price"])
+
+    def test_trailing_stop_activates_after_completed_plus_one_r_close(self):
+        bars = [
+            bar("2026-08-14T10:05:00-04:00", 9.8, 10.2, 9.7, 10.1),
+            bar("2026-08-14T10:10:00-04:00", 10.1, 10.7, 10.0, 10.6),
+        ]
+        result = self.monitor.evaluate_trailing(self.record, bars, datetime.fromisoformat("2026-08-14T10:15:00-04:00"))
+        self.assertEqual(result["trailing_outcome"]["status"], "OPEN")
+        self.assertTrue(result["trailing_outcome"]["trailing_active"])
+        self.assertEqual(result["trailing_outcome"]["trailing_stop"], 9.7)
+        self.assertEqual(result["trailing_outcome"]["trailing_updates"], 1)
+
+    def test_trailing_update_applies_only_to_later_bar_and_never_moves_down(self):
+        first_bars = [
+            bar("2026-08-14T10:05:00-04:00", 9.8, 10.2, 9.7, 10.1),
+            bar("2026-08-14T10:10:00-04:00", 10.1, 10.7, 10.0, 10.6),
+            bar("2026-08-14T10:15:00-04:00", 10.6, 10.9, 10.2, 10.8),
+        ]
+        first = self.monitor.evaluate_trailing(self.record, first_bars, datetime.fromisoformat("2026-08-14T10:20:00-04:00"))
+        self.assertEqual(first["trailing_outcome"]["status"], "OPEN")
+        self.assertEqual(first["trailing_outcome"]["trailing_stop"], 10.0)
+        all_bars = first_bars + [bar("2026-08-14T10:20:00-04:00", 10.8, 11.0, 9.9, 10.1)]
+        result = self.monitor.evaluate_trailing(first, all_bars, datetime.fromisoformat("2026-08-14T10:25:00-04:00"))
+        self.assertEqual(result["trailing_outcome"]["status"], "STOPPED")
+        self.assertEqual(result["trailing_outcome"]["exit_reason"], "TRAILING_STOP")
+        self.assertEqual(result["trailing_outcome"]["exit_price"], 10.0)
 
 
 if __name__ == "__main__":

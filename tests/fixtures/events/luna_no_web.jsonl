@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"test"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"m1","type":"mcp_tool_call","server":"robinhood-trading","tool":"get_accounts"}}
+{"type":"item.completed","item":{"id":"m1","type":"mcp_tool_call","server":"robinhood-trading","tool":"get_accounts"}}
+{"type":"item.completed","item":{"id":"a1","type":"agent_message","text":"{\"ok\":true,\"web_search_count\":99}"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}

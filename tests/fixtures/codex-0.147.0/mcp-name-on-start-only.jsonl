@@ -1,0 +1,13 @@
+{"type":"thread.started"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"m1","type":"mcp_tool_call","server":"robinhood-trading","tool":"get_accounts"}}
+{"type":"item.completed","item":{"id":"m1","type":"mcp_tool_call"}}
+{"type":"item.started","item":{"id":"m2","type":"mcp_tool_call","server":"robinhood-trading","tool":"get_portfolio"}}
+{"type":"item.completed","item":{"id":"m2","type":"mcp_tool_call"}}
+{"type":"item.started","item":{"id":"m3","type":"mcp_tool_call","server":"robinhood-trading","tool":"get_equity_positions"}}
+{"type":"item.completed","item":{"id":"m3","type":"mcp_tool_call"}}
+{"type":"item.started","item":{"id":"m4","type":"mcp_tool_call","server":"robinhood-trading","tool":"get_equity_orders"}}
+{"type":"item.completed","item":{"id":"m4","type":"mcp_tool_call"}}
+{"type":"item.completed","item":{"id":"a1","type":"agent_message"}}
+{"type":"item.completed","item":{"id":"a2","type":"agent_message"}}
+{"type":"turn.completed"}

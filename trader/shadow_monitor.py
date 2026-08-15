@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta
+import math
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .models import SchemaValidationError, ShadowPlanStatus
 
@@ -19,12 +21,52 @@ def _ceil_five_minutes(value: datetime) -> datetime:
     return floored if value == floored else floored + timedelta(minutes=5)
 
 
+ET = ZoneInfo("America/New_York")
+
+
 def validate_bar(bar: dict[str, Any]) -> None:
-    _dt(bar["timestamp"])
+    required = {"timestamp", "open", "high", "low", "close", "volume", "complete"}
+    if not isinstance(bar, dict) or not required <= set(bar):
+        raise SchemaValidationError("Malformed OHLCV bar structure")
+    timestamp = _dt(bar["timestamp"])
+    if timestamp.second or timestamp.microsecond or timestamp.astimezone(ET).minute % 5:
+        raise SchemaValidationError(f"Bar is not five-minute aligned: {bar['timestamp']}")
     low, high = float(bar["low"]), float(bar["high"])
-    open_price, close = float(bar["open"]), float(bar["close"])
+    open_price, close, volume = float(bar["open"]), float(bar["close"]), float(bar["volume"])
+    if not all(math.isfinite(item) for item in (low, high, open_price, close, volume)) or min(low, high, open_price, close) <= 0 or volume < 0:
+        raise SchemaValidationError(f"Non-finite or non-positive OHLCV bar at {bar['timestamp']}")
     if low > high or not (low <= open_price <= high) or not (low <= close <= high):
         raise SchemaValidationError(f"Malformed OHLC bar at {bar['timestamp']}")
+
+
+def validate_bar_series(bars: list[dict[str, Any]], *, session_date: str, as_of: datetime, mandatory_flat: datetime) -> list[dict[str, Any]]:
+    if as_of.tzinfo is None:
+        raise SchemaValidationError("Trusted as_of must be timezone-aware")
+    session_day = datetime.fromisoformat(session_date).date()
+    market_open = datetime.combine(session_day, datetime.min.time(), ET).replace(hour=9, minute=30)
+    market_close = datetime.combine(session_day, datetime.min.time(), ET).replace(hour=16)
+    prior: datetime | None = None
+    seen: set[datetime] = set()
+    validated = []
+    for bar in bars:
+        validate_bar(bar)
+        if bar.get("complete") is not True:
+            raise SchemaValidationError("Incomplete bar cannot be used by ShadowPlanMonitor")
+        timestamp = _dt(bar["timestamp"]).astimezone(ET)
+        if timestamp.date() != session_day:
+            raise SchemaValidationError("Bar belongs to the wrong market session date")
+        if timestamp < market_open or timestamp >= market_close:
+            raise SchemaValidationError("Bar is outside regular-session bounds")
+        if timestamp > mandatory_flat.astimezone(ET):
+            raise SchemaValidationError("Bar is after the mandatory-flat boundary")
+        if timestamp + timedelta(minutes=5) > as_of.astimezone(ET):
+            raise SchemaValidationError("Bar was not knowable at trusted as_of time")
+        if timestamp in seen:
+            raise SchemaValidationError("Duplicate bar timestamp")
+        if prior is not None and timestamp <= prior:
+            raise SchemaValidationError("Bars must be in strict chronological order")
+        seen.add(timestamp); prior = timestamp; validated.append(bar)
+    return validated
 
 
 def aggregate_completed_15m(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -68,17 +110,14 @@ class ShadowPlanMonitor:
         first_eligible = _ceil_five_minutes(decision_time)
         latest_entry = _dt(plan["latest_entry_time"])
         mandatory_flat = _dt(plan["mandatory_flat_time"])
+        if as_of is None or as_of.tzinfo is None:
+            raise SchemaValidationError("ShadowPlanMonitor requires a trusted timezone-aware as_of")
         trigger = float(plan["entry_trigger"])
         chase = float(plan["maximum_chase_price"])
         stop = float(plan["stop_price"])
         target = float(plan["target1"])
         target2 = plan.get("target2_optional")
-        ordered: list[dict[str, Any]] = []
-        for bar in bars:
-            validate_bar(bar)
-            if bar.get("complete"):
-                ordered.append(bar)
-        ordered.sort(key=lambda item: _dt(item["timestamp"]))
+        ordered = validate_bar_series(bars, session_date=decision_time.astimezone(ET).date().isoformat(), as_of=as_of, mandatory_flat=mandatory_flat)
         ordered = [bar for bar in ordered if _dt(bar["timestamp"]) >= first_eligible]
         entry_bar_time = _dt(outcome["entry_bar_timestamp"]) if outcome.get("entry_bar_timestamp") else None
         if outcome["status"] == ShadowPlanStatus.OPEN and entry_bar_time is not None:
@@ -101,8 +140,9 @@ class ShadowPlanMonitor:
                     "entry_via_open": entry[1],
                     "entry_at_close": entry[2],
                     "entry_before_cutoff": True,
-                    "mfe": 0.0,
-                    "mae": 0.0,
+                    "mfe": 0.0 if entry[1] or entry[2] else None,
+                    "mae": 0.0 if entry[1] or entry[2] else None,
+                    "excursions_unknown": not (entry[1] or entry[2]),
                 })
                 entry_bar_time = timestamp
 
@@ -116,10 +156,13 @@ class ShadowPlanMonitor:
             same_entry_bar = entry_bar_time == timestamp
             if same_entry_bar and outcome.get("entry_at_close", False):
                 continue
-            outcome["mfe"] = max(float(outcome.get("mfe", 0)), float(bar["high"]) - entry_price)
             if same_entry_bar and not outcome.get("entry_via_open", False):
                 outcome["mae_ambiguous"] = True
-            else:
+                outcome["mfe"] = None
+                outcome["mae"] = None
+                outcome["excursions_unknown"] = True
+            elif not outcome.get("excursions_unknown", False):
+                outcome["mfe"] = max(float(outcome.get("mfe", 0)), float(bar["high"]) - entry_price)
                 outcome["mae"] = min(float(outcome.get("mae", 0)), float(bar["low"]) - entry_price)
             if target2 is not None and float(bar["high"]) >= float(target2):
                 outcome["target2_hit"] = True
@@ -134,13 +177,14 @@ class ShadowPlanMonitor:
                 self._ambiguous(outcome, timestamp, "ENTRY_AND_STOP_ORDER_UNKNOWN_IN_5M_BAR")
                 break
             if stop_hit:
-                self._close(outcome, ShadowPlanStatus.STOPPED, timestamp, stop, plan)
+                self._close(outcome, ShadowPlanStatus.STOPPED, timestamp, min(stop, float(bar["open"])), plan)
+                outcome["stop_price_basis"] = "WORSE_OF_STOP_OR_COMPLETED_BAR_OPEN"
                 break
             if target_hit:
                 self._close(outcome, ShadowPlanStatus.TARGET1, timestamp, target, plan)
                 break
 
-        current = as_of or (max((_dt(bar["timestamp"]) + timedelta(minutes=5) for bar in ordered), default=decision_time))
+        current = as_of
         if outcome["status"] == ShadowPlanStatus.PENDING and current >= latest_entry:
             outcome.update({"status": ShadowPlanStatus.EXPIRED, "entry_before_cutoff": False, "exit_reason": "ENTRY_NOT_TRIGGERED_BEFORE_CUTOFF"})
         elif outcome["status"] == ShadowPlanStatus.OPEN and current >= mandatory_flat:
@@ -151,6 +195,108 @@ class ShadowPlanMonitor:
                 outcome["flat_price_basis"] = "LAST_COMPLETED_5M_CLOSE_AT_OR_BEFORE_FLAT"
 
         record["outcome"] = outcome
+        return record
+
+    def evaluate_trailing(self, plan_record: dict[str, Any], bars: list[dict[str, Any]], as_of: datetime | None = None) -> dict[str, Any]:
+        """Evaluate a no-lookahead two-bar structure trail from the same entry."""
+        record = deepcopy(plan_record)
+        plan = record["original_plan"]
+        outcome = deepcopy(record.get("trailing_outcome") or self.initial_trailing_outcome(plan.get("stop_price")))
+        if outcome["status"] not in {ShadowPlanStatus.PENDING, ShadowPlanStatus.OPEN}:
+            return record
+        if as_of is None or as_of.tzinfo is None:
+            raise SchemaValidationError("Trailing monitor requires a trusted timezone-aware as_of")
+
+        decision_time = _dt(plan["decision_timestamp"])
+        first_eligible = _ceil_five_minutes(decision_time)
+        latest_entry = _dt(plan["latest_entry_time"])
+        mandatory_flat = _dt(plan["mandatory_flat_time"])
+        trigger, chase = float(plan["entry_trigger"]), float(plan["maximum_chase_price"])
+        initial_stop = float(plan["stop_price"])
+        quantity = float(plan["hypothetical_quantity"])
+        activation_r = float(plan.get("trailing_activation_r", 1.0))
+        lookback = int(plan.get("trailing_lookback_bars", 2))
+        if activation_r <= 0 or lookback < 2:
+            raise SchemaValidationError("Trailing configuration is outside safe bounds")
+        ordered = validate_bar_series(bars, session_date=decision_time.astimezone(ET).date().isoformat(), as_of=as_of, mandatory_flat=mandatory_flat)
+        ordered = [bar for bar in ordered if _dt(bar["timestamp"]) >= first_eligible]
+        processed = _dt(outcome["last_processed_bar_timestamp"]) if outcome.get("last_processed_bar_timestamp") else None
+        if processed is not None:
+            ordered = [bar for bar in ordered if _dt(bar["timestamp"]) > processed]
+
+        for bar in ordered:
+            timestamp = _dt(bar["timestamp"])
+            if outcome["status"] == ShadowPlanStatus.PENDING:
+                if timestamp >= latest_entry:
+                    break
+                entry = self._entry_price(plan, bar, trigger, chase)
+                if entry is None:
+                    outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
+                    continue
+                outcome.update({
+                    "status": ShadowPlanStatus.OPEN, "entry_triggered": True,
+                    "entry_timestamp": timestamp.isoformat(), "entry_bar_timestamp": timestamp.isoformat(),
+                    "entry_price": entry[0], "entry_via_open": entry[1], "entry_at_close": entry[2],
+                    "entry_before_cutoff": True, "trailing_stop": initial_stop,
+                    "mfe": 0.0 if entry[1] or entry[2] else None,
+                    "mae": 0.0 if entry[1] or entry[2] else None,
+                    "excursions_unknown": not (entry[1] or entry[2]),
+                })
+
+            if outcome["status"] != ShadowPlanStatus.OPEN:
+                break
+            if timestamp >= mandatory_flat:
+                self._close(outcome, ShadowPlanStatus.FLAT_TIME, mandatory_flat, float(bar["open"]), plan)
+                outcome["flat_price_basis"] = "MANDATORY_FLAT_5M_BAR_OPEN"
+                outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
+                break
+
+            entry_price = float(outcome["entry_price"])
+            same_entry_bar = outcome.get("entry_bar_timestamp") == timestamp.isoformat()
+            if same_entry_bar and outcome.get("entry_at_close"):
+                outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
+                outcome["recent_completed_lows"] = (outcome.get("recent_completed_lows", []) + [float(bar["low"])])[-lookback:]
+                continue
+            if same_entry_bar and not outcome.get("entry_via_open"):
+                outcome.update({"mae_ambiguous": True, "mfe": None, "mae": None, "excursions_unknown": True})
+            elif not outcome.get("excursions_unknown", False):
+                outcome["mfe"] = max(float(outcome.get("mfe", 0)), float(bar["high"]) - entry_price)
+                outcome["mae"] = min(float(outcome.get("mae", 0)), float(bar["low"]) - entry_price)
+
+            active_stop = float(outcome.get("trailing_stop") or initial_stop)
+            stop_hit = float(bar["low"]) <= active_stop
+            crossed_from_below = same_entry_bar and not outcome.get("entry_via_open", False)
+            if stop_hit and crossed_from_below:
+                self._ambiguous(outcome, timestamp, "ENTRY_AND_TRAILING_STOP_ORDER_UNKNOWN_IN_5M_BAR")
+                break
+            if stop_hit:
+                self._close(outcome, ShadowPlanStatus.STOPPED, timestamp, min(active_stop, float(bar["open"])), plan)
+                outcome["exit_reason"] = "TRAILING_STOP" if outcome.get("trailing_active") else "INITIAL_STOP"
+                outcome["stop_hit"] = True
+                outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
+                break
+
+            lows = (outcome.get("recent_completed_lows", []) + [float(bar["low"])])[-lookback:]
+            outcome["recent_completed_lows"] = lows
+            activation_price = entry_price + activation_r * (float(plan["planned_dollar_risk"]) / quantity)
+            if float(bar["close"]) >= activation_price:
+                outcome["trailing_active"] = True
+            if outcome.get("trailing_active") and len(lows) == lookback:
+                candidate = min(lows)
+                new_stop = max(active_stop, candidate)
+                if new_stop > active_stop:
+                    outcome["trailing_stop"] = new_stop
+                    outcome["trailing_updates"] = int(outcome.get("trailing_updates", 0)) + 1
+            outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
+
+        if outcome["status"] == ShadowPlanStatus.PENDING and as_of >= latest_entry:
+            outcome.update({"status": ShadowPlanStatus.EXPIRED, "entry_before_cutoff": False, "exit_reason": "ENTRY_NOT_TRIGGERED_BEFORE_CUTOFF"})
+        elif outcome["status"] == ShadowPlanStatus.OPEN and as_of >= mandatory_flat:
+            eligible = [bar for bar in validate_bar_series(bars, session_date=decision_time.astimezone(ET).date().isoformat(), as_of=as_of, mandatory_flat=mandatory_flat) if _dt(bar["timestamp"]) + timedelta(minutes=5) <= mandatory_flat]
+            if eligible:
+                self._close(outcome, ShadowPlanStatus.FLAT_TIME, mandatory_flat, float(eligible[-1]["close"]), plan)
+                outcome["flat_price_basis"] = "LAST_COMPLETED_5M_CLOSE_AT_OR_BEFORE_FLAT"
+        record["trailing_outcome"] = outcome
         return record
 
     @staticmethod
@@ -208,8 +354,22 @@ class ShadowPlanMonitor:
             "mfe": None,
             "mae": None,
             "mae_ambiguous": False,
+            "excursions_unknown": False,
             "pnl": None,
             "realized_r": None,
             "ambiguous": False,
             "ambiguity_reason": None,
         }
+
+    @staticmethod
+    def initial_trailing_outcome(initial_stop: float | None = None) -> dict[str, Any]:
+        outcome = ShadowPlanMonitor.initial_outcome()
+        outcome.update({
+            "variant": "TRAILING_STOP",
+            "trailing_active": False,
+            "trailing_stop": float(initial_stop) if initial_stop is not None else None,
+            "trailing_updates": 0,
+            "recent_completed_lows": [],
+            "last_processed_bar_timestamp": None,
+        })
+        return outcome

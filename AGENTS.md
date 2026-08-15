@@ -903,6 +903,20 @@ and performance by time of day.
 
 Do not conclude the system has an edge from a small sample.
 
+\## ACCELERATED SHADOW EXPERIMENT
+
+In SHADOW MODE only, one orchestrator may track up to four independently qualified candidates from one ranked finalist set.
+
+The first accepted plan is PRIMARY. Later accepted plans are CHALLENGER research observations. Challengers are isolated hypothetical accounts, are never aggregated into deployable buying power or portfolio risk, and do not relax the one-live-trade or one-live-position limits.
+
+For every accepted plan, evaluate the same entry and initial stop under both FIXED_TARGET and TRAILING_STOP exits. Trailing calculations may use only completed bars known at that time. A trailing update applies only to later bars and may never move downward.
+
+Use the first 15 completed sessions for development. Select and freeze an exit variant using only that development evidence and stress-adjusted results. Use the next 15 completed sessions after freezing for out-of-sample validation. If development evidence is insufficient, extend development; never weaken a threshold merely to meet a date.
+
+Automation may schedule scans, monitor hypothetical plans, complete EOD analysis, select the deterministic exit-policy winner, and generate reports. Automation may not edit source code, change risk limits, enable new instruments, enable short selling, alter permissions, or activate APPROVAL/LIVE mode. Those are major decisions requiring human review.
+
+Thirty sessions are a review target, not a promise of profitability or live activation. Failed validation means remain in SHADOW MODE.
+
 
 
 \## CORE PRINCIPLE

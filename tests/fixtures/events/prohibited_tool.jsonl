@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"test"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"m1","type":"mcp_tool_call","server":"robinhood-trading","tool":"review_equity_order"}}
+{"type":"item.completed","item":{"id":"m1","type":"mcp_tool_call","server":"robinhood-trading","tool":"review_equity_order"}}
+{"type":"item.completed","item":{"id":"a1","type":"agent_message","text":"{\"ok\":true}"}}
+{"type":"turn.completed","usage":{}}

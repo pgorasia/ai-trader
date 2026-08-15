@@ -1,6 +1,7 @@
 mode: SHADOW
 timezone: America/New_York
 exchange_calendar: XNYS
+strategy_version: ai-daytrader-v1-accelerated-shadow-2026-08
 
 scanner:
   name: AI-DayTrader-V1
@@ -15,7 +16,8 @@ models:
   sol_reasoning_effort: high
 
 codex:
-  executable: codex
+  executable: auto
+  strip_openai_api_key: true
   timeout_seconds: 240
   transient_read_retries: 1
   retry_backoff_seconds: 2
@@ -33,6 +35,7 @@ schedule:
   morning_interval_minutes: 10
   midday_interval_minutes: 25
   afternoon_interval_minutes: 10
+  stale_slot_grace_seconds: 30
 
 risk:
   reference_capital: 100.0
@@ -46,12 +49,22 @@ risk:
 cooldown:
   senior_rejection_minutes: 30
 
+experiment:
+  maximum_research_candidates_per_session: 4
+  development_sessions: 15
+  validation_sessions: 15
+  minimum_development_pairs: 8
+  minimum_validation_primary_trades: 8
+  trailing_activation_r: 1.0
+  trailing_lookback_completed_bars: 2
+
 readiness:
-  minimum_market_sessions: 10
-  minimum_completed_shadow_trades: 20
+  minimum_market_sessions: 30
+  minimum_completed_shadow_trades: 8
   estimated_round_trip_cost_bps: 20
-  minimum_profit_factor: 1.0
-  maximum_single_winner_gross_profit_fraction: 0.50
+  stress_round_trip_cost_bps: 75
+  minimum_profit_factor: 1.20
+  maximum_single_winner_gross_profit_fraction: 0.35
   maximum_drawdown_dollars: 5.0
   maximum_security_violations: 0
   maximum_unresolved_state_failures: 0

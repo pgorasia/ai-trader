@@ -5,3 +5,8 @@ __pycache__/
 state/*.json
 logs/*.log
 logs/alerts/*.json
+.runtime/
+# Operational evidence can include account equity and trading research. Keep it
+# local; Git is for reviewed code/configuration, not unattended session data.
+reports/????-??-??-*.json
+reports/????-??-??-*.md

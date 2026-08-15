@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"test"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"w1","type":"web_search"}}
+{"type":"item.completed","item":{"id":"w1","type":"web_search","query":"test"}}
+{"type":"item.completed","item":{"id":"a1","type":"agent_message","text":"{\"ok\":true}"}}
+{"type":"turn.completed","usage":{}}

@@ -58,6 +58,9 @@ class CodexRunResult:
     tool_calls: dict[str, int] = field(default_factory=dict)
     web_searches: int = 0
     attempts: int = 1
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class TraderError(RuntimeError):
@@ -77,7 +80,9 @@ class SchemaValidationError(TraderError):
 
 
 class CodexRunError(TraderError):
-    pass
+    def __init__(self, message: str, *, diagnostics: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 class CodexTimeoutError(CodexRunError):

@@ -43,6 +43,10 @@ class SessionScheduler:
         current = now.astimezone(ET)
         return [slot for slot in self.scan_times(session) if slot >= current and slot.isoformat() not in completed]
 
+    def is_stale(self, slot: datetime, actual: datetime) -> bool:
+        grace = timedelta(seconds=int(self.config.get("stale_slot_grace_seconds", 30)))
+        return actual.astimezone(ET) > slot.astimezone(ET) + grace
+
     @staticmethod
     def late_selectivity(session: MarketSession, timestamp: datetime) -> str:
         remaining = (session.latest_entry - timestamp.astimezone(ET)).total_seconds() / 60

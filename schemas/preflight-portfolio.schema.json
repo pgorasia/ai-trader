@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SHADOW preflight portfolio stage",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["passed", "account_classifications", "account_reconciled", "account_equity", "buying_power", "portfolio_status", "errors"],
+  "properties": {
+    "passed": {"type": "boolean"},
+    "account_classifications": {"type": "array", "items": {"$ref": "#/$defs/accountClassification"}},
+    "account_reconciled": {"type": "boolean"},
+    "account_equity": {"type": ["number", "null"]},
+    "buying_power": {"type": ["number", "null"]},
+    "portfolio_status": {"type": ["string", "null"]},
+    "errors": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {"accountClassification": {"type": "object", "additionalProperties": false, "required": ["agentic_allowed", "brokerage_account_type", "management_type", "state", "deactivated", "permanently_deactivated"], "properties": {"agentic_allowed": {"type": "boolean"}, "brokerage_account_type": {"type": "string"}, "management_type": {"type": "string"}, "state": {"type": "string"}, "deactivated": {"type": "boolean"}, "permanently_deactivated": {"type": "boolean"}}}}
+}

@@ -1,5 +1,7 @@
 {
   "cycle_id": "2026-08-14-cycle-1",
+  "session_date": "2026-08-14",
+  "scanner": {"name": "AI-DayTrader-V1", "id": "c4646257-9c99-4e35-801b-80f8b83b81ea"},
   "timestamp": "2026-08-14T09:40:05-04:00",
   "scanner_total": 0,
   "symbols_processed": [],

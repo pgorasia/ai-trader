@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"test"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"a1","type":"agent_message","text":"{\"first\":true}"}}
+{"type":"item.completed","item":{"id":"a2","type":"agent_message","text":"{\"second\":true}"}}
+{"type":"turn.completed","usage":{}}

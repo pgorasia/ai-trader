@@ -3,89 +3,290 @@
   "title": "Luna Stage-B cycle",
   "type": "object",
   "additionalProperties": false,
-  "required": ["cycle_id", "timestamp", "scanner_total", "symbols_processed", "finalists", "security_status", "account_status", "tool_call_count", "errors", "sol_escalation"],
+  "required": [
+    "cycle_id",
+    "session_date",
+    "scanner",
+    "timestamp",
+    "scanner_total",
+    "symbols_processed",
+    "finalists",
+    "security_status",
+    "account_status",
+    "tool_call_count",
+    "errors",
+    "sol_escalation"
+  ],
   "properties": {
-    "cycle_id": {"type": "string", "minLength": 1},
-    "timestamp": {"type": "string", "format": "date-time"},
-    "scanner_total": {"type": "integer", "minimum": 0},
-    "symbols_processed": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Z.\\-]{1,10}$"}},
-    "finalists": {
-      "type": "array", "maxItems": 3,
+    "cycle_id": {
+      "type": "string"
+    },
+    "session_date": {
+      "type": "string"
+    },
+    "scanner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "id"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      }
+    },
+    "timestamp": {
+      "type": "string"
+    },
+    "scanner_total": {
+      "type": "integer"
+    },
+    "symbols_processed": {
+      "type": "array",
       "items": {
-        "type": "object", "additionalProperties": false,
-        "required": ["symbol", "classification", "scanner_percent_change", "rvol", "gap_return", "intraday_return", "distance_from_high", "distance_from_vwap", "vwap", "rsi14", "ema20", "volume_persistence", "technical_reason", "material_requalification"],
+        "type": "string"
+      }
+    },
+    "finalists": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "symbol",
+          "classification",
+          "scanner_percent_change",
+          "rvol",
+          "gap_return",
+          "intraday_return",
+          "distance_from_high",
+          "distance_from_vwap",
+          "vwap",
+          "rsi14",
+          "ema20",
+          "volume_persistence",
+          "technical_reason",
+          "material_requalification",
+          "completed_15m_structure"
+        ],
         "properties": {
-          "symbol": {"type": "string", "pattern": "^[A-Z.\\-]{1,10}$"},
-          "classification": {"enum": ["NEW", "MATERIALLY_REQUALIFIED", "COOLDOWN", "PREVIOUSLY_REJECTED_NO_MATERIAL_CHANGE"]},
-          "scanner_percent_change": {"type": "number"},
-          "rvol": {"type": "number", "minimum": 0},
-          "gap_return": {"type": "number"},
-          "intraday_return": {"type": "number"},
-          "distance_from_high": {"type": "number", "minimum": 0},
-          "distance_from_vwap": {"type": "number"},
-          "vwap": {"type": "number", "exclusiveMinimum": 0},
-          "rsi14": {"type": "number", "minimum": 0, "maximum": 100},
-          "ema20": {"type": "number", "exclusiveMinimum": 0},
-          "volume_persistence": {"type": "number", "minimum": 0},
-          "technical_reason": {"type": "string", "minLength": 1},
+          "symbol": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "NEW",
+              "MATERIALLY_REQUALIFIED",
+              "COOLDOWN",
+              "PREVIOUSLY_REJECTED_NO_MATERIAL_CHANGE"
+            ]
+          },
+          "scanner_percent_change": {
+            "type": "number"
+          },
+          "rvol": {
+            "type": "number"
+          },
+          "gap_return": {
+            "type": "number"
+          },
+          "intraday_return": {
+            "type": "number"
+          },
+          "distance_from_high": {
+            "type": "number"
+          },
+          "distance_from_vwap": {
+            "type": "number"
+          },
+          "vwap": {
+            "type": "number"
+          },
+          "rsi14": {
+            "type": "number"
+          },
+          "ema20": {
+            "type": "number"
+          },
+          "volume_persistence": {
+            "type": "number"
+          },
+          "technical_reason": {
+            "type": "string"
+          },
           "material_requalification": {
-            "oneOf": [
-              {"type": "null"},
+            "anyOf": [
               {
-                "type": "object", "additionalProperties": false,
-                "required": ["event_type", "evidence", "new_high_only"],
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "event_type",
+                  "evidence",
+                  "evidence_timestamp",
+                  "new_high_only"
+                ],
                 "properties": {
-                  "event_type": {"enum": ["COMPLETED_BASE_BREAKOUT", "PULLBACK_RECLAIM", "REDUCED_EXTENSION_RENEWED_STRUCTURE", "MATERIALLY_DIFFERENT_PRICE_VOLUME", "NEW_CATALYST", "COOLDOWN_EXPIRED_STRUCTURE_WARRANTS_ESCALATION"]},
-                  "evidence": {"type": "string", "minLength": 1},
-                  "new_high_only": {"const": false}
+                  "event_type": {
+                    "enum": [
+                      "COMPLETED_BASE_BREAKOUT",
+                      "PULLBACK_RECLAIM",
+                      "REDUCED_EXTENSION_RENEWED_STRUCTURE",
+                      "MATERIALLY_DIFFERENT_PRICE_VOLUME",
+                      "NEW_CATALYST"
+                    ]
+                  },
+                  "evidence": {
+                    "type": "string"
+                  },
+                  "evidence_timestamp": {
+                    "type": "string"
+                  },
+                  "new_high_only": {
+                    "const": false
+                  }
                 }
               }
             ]
           },
           "completed_15m_structure": {
-            "type": "array", "maxItems": 8,
-            "items": {"$ref": "#/$defs/bar"}
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/bar"
+            }
           }
         }
       }
     },
     "security_status": {
-      "type": "object", "additionalProperties": false,
-      "required": ["robinhood_mcp_available", "boundary_ok", "forbidden_tools_available"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "robinhood_mcp_available",
+        "boundary_ok",
+        "forbidden_tools_available"
+      ],
       "properties": {
-        "robinhood_mcp_available": {"type": "boolean"},
-        "boundary_ok": {"type": "boolean"},
-        "forbidden_tools_available": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+        "robinhood_mcp_available": {
+          "type": "boolean"
+        },
+        "boundary_ok": {
+          "type": "boolean"
+        },
+        "forbidden_tools_available": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       }
     },
     "account_status": {
-      "type": "object", "additionalProperties": false,
-      "required": ["agentic_account_count", "reconciled", "account_equity", "buying_power", "unexpected_positions", "unexpected_orders"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agentic_account_count",
+        "reconciled",
+        "account_equity",
+        "buying_power",
+        "unexpected_positions",
+        "unexpected_orders"
+      ],
       "properties": {
-        "agentic_account_count": {"type": "integer", "minimum": 0},
-        "reconciled": {"type": "boolean"},
-        "account_equity": {"type": ["number", "null"], "minimum": 0},
-        "buying_power": {"type": ["number", "null"], "minimum": 0},
-        "unexpected_positions": {"type": "integer", "minimum": 0},
-        "unexpected_orders": {"type": "integer", "minimum": 0}
+        "agentic_account_count": {
+          "type": "integer"
+        },
+        "reconciled": {
+          "type": "boolean"
+        },
+        "account_equity": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "buying_power": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "unexpected_positions": {
+          "type": "integer"
+        },
+        "unexpected_orders": {
+          "type": "integer"
+        }
       }
     },
     "tool_call_count": {
-      "type": "object", "additionalProperties": {"type": "integer", "minimum": 0},
-      "required": ["total"], "properties": {"total": {"type": "integer", "minimum": 0}}
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total",
+        "run_scan"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer"
+        },
+        "run_scan": {
+          "type": "integer"
+        }
+      }
     },
-    "errors": {"type": "array", "items": {"type": "string"}},
-    "sol_escalation": {"type": "boolean"}
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sol_escalation": {
+      "type": "boolean"
+    }
   },
   "$defs": {
     "bar": {
-      "type": "object", "additionalProperties": false,
-      "required": ["timestamp", "open", "high", "low", "close", "volume", "complete"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "complete"
+      ],
       "properties": {
-        "timestamp": {"type": "string", "format": "date-time"},
-        "open": {"type": "number", "exclusiveMinimum": 0}, "high": {"type": "number", "exclusiveMinimum": 0},
-        "low": {"type": "number", "exclusiveMinimum": 0}, "close": {"type": "number", "exclusiveMinimum": 0},
-        "volume": {"type": "number", "minimum": 0}, "complete": {"const": true}
+        "timestamp": {
+          "type": "string"
+        },
+        "open": {
+          "type": "number"
+        },
+        "high": {
+          "type": "number"
+        },
+        "low": {
+          "type": "number"
+        },
+        "close": {
+          "type": "number"
+        },
+        "volume": {
+          "type": "number"
+        },
+        "complete": {
+          "const": true
+        }
       }
     }
   }

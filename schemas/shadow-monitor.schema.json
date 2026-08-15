@@ -3,28 +3,83 @@
   "title": "Read-only Shadow plan market data",
   "type": "object",
   "additionalProperties": false,
-  "required": ["timestamp", "symbol_bars", "tool_call_count", "errors"],
+  "required": [
+    "timestamp",
+    "symbol_bars",
+    "tool_call_count",
+    "errors"
+  ],
   "properties": {
-    "timestamp": {"type": "string", "format": "date-time"},
+    "timestamp": {
+      "type": "string"
+    },
     "symbol_bars": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "array",
-        "items": {"$ref": "#/$defs/bar"}
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "symbol",
+          "bars"
+        ],
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "bars": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/bar"
+            }
+          }
+        }
       }
     },
-    "tool_call_count": {"type": "integer", "minimum": 0},
-    "errors": {"type": "array", "items": {"type": "string"}}
+    "tool_call_count": {
+      "type": "integer"
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
   },
   "$defs": {
     "bar": {
-      "type": "object", "additionalProperties": false,
-      "required": ["timestamp", "open", "high", "low", "close", "volume", "complete"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "complete"
+      ],
       "properties": {
-        "timestamp": {"type": "string", "format": "date-time"},
-        "open": {"type": "number", "exclusiveMinimum": 0}, "high": {"type": "number", "exclusiveMinimum": 0},
-        "low": {"type": "number", "exclusiveMinimum": 0}, "close": {"type": "number", "exclusiveMinimum": 0},
-        "volume": {"type": "number", "minimum": 0}, "complete": {"type": "boolean"}
+        "timestamp": {
+          "type": "string"
+        },
+        "open": {
+          "type": "number"
+        },
+        "high": {
+          "type": "number"
+        },
+        "low": {
+          "type": "number"
+        },
+        "close": {
+          "type": "number"
+        },
+        "volume": {
+          "type": "number"
+        },
+        "complete": {
+          "type": "boolean"
+        }
       }
     }
   }
