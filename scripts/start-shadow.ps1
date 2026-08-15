@@ -10,6 +10,15 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
 
+# A host-local marker provides an immediate, non-administrator kill switch.
+# It is deliberately ignored by Git so disabling one runner does not disable
+# another checkout, such as the Oracle VM.
+$disableMarker = Join-Path $projectRoot ".runtime\disable-local-shadow"
+if (Test-Path -LiteralPath $disableMarker) {
+    Write-Output "Local SHADOW launcher is disabled by marker: $disableMarker"
+    exit 0
+}
+
 $logDirectory = Join-Path $projectRoot "logs"
 New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
