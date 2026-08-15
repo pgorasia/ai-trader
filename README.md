@@ -55,7 +55,7 @@ Readiness is deterministic and configurable in `config/strategy.yaml`. The accel
 
 ## Windows wake task
 
-Open PowerShell once as Administrator, change to this repository, and run `powershell -ExecutionPolicy Bypass -File .\scripts\install-scheduler.ps1`. The installed S4U task can run while the user is logged off, wakes a sleeping PC, starts the WSL virtual environment, and writes a dated local log. The PC must remain powered or sleeping, not shut down. Verify it with `powershell -ExecutionPolicy Bypass -File .\scripts\check-scheduler.ps1`.
+Open PowerShell once as Administrator, change to this repository, and run `powershell -ExecutionPolicy Bypass -File .\scripts\install-scheduler.ps1`. The installer enables wake timers on AC power while leaving battery wakeups disabled. The installed S4U task can run while the user is logged off, wakes a sleeping PC, starts the WSL virtual environment, and writes a dated local log. Keep the PC plugged in and powered or sleeping, not shut down. Verify it with `powershell -ExecutionPolicy Bypass -File .\scripts\check-scheduler.ps1`.
 
 Operational state, logs, and date-based reports stay out of Git because they can contain account equity and proprietary trading evidence. Git remains the reviewed source of truth for code, prompts, schemas, and configuration. A `major-decision-required` report is created only after validation completes; no automated process can enable live trading, short selling, or broader permissions.
 

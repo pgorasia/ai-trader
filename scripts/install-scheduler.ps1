@@ -28,6 +28,17 @@ $userId = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:U
 $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType S4U -RunLevel Limited
 
 if ($PSCmdlet.ShouldProcess($TaskName, "Register conservative weekday wake task at $($conservativeLocalWake.ToString('HH:mm')) local time")) {
+    # WakeToRun cannot wake a sleeping computer when the active Windows power
+    # plan disables wake timers. Enable them on AC power only; battery wakeups
+    # remain disabled to avoid unattended battery drain.
+    & powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to enable AC wake timers for the active Windows power plan."
+    }
+    & powercfg.exe /setactive SCHEME_CURRENT
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to apply the active Windows power plan after enabling AC wake timers."
+    }
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Wakes the deterministic SHADOW research orchestrator; Python owns the exchange schedule." -Force | Out-Null
-    Write-Output "Installed '$TaskName' for unattended S4U execution. Conservative wake time: $($conservativeLocalWake.ToString('HH:mm')) local. Keep the PC powered or sleeping (not shut down); Python/XNYS owns holidays, market timing, and DST."
+    Write-Output "Installed '$TaskName' for unattended S4U execution and enabled AC wake timers. Conservative wake time: $($conservativeLocalWake.ToString('HH:mm')) local. Keep the PC plugged in and powered or sleeping (not shut down); Python/XNYS owns holidays, market timing, and DST."
 }
