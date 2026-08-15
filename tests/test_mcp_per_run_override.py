@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 from trader.codex_runner import CodexRunner, build_robinhood_enabled_tools_override
 from trader.models import CodexRunError, CodexTimeoutError
-from trader.safety import load_config
 from trader.shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, ShadowBoundaryResult, locate_codex_config
 
 
@@ -131,12 +130,14 @@ oauth_token = "BASE-ONLY-SECRET"
         self.assertIs(child.call_args.kwargs["shell"], False)
 
     def test_global_config_file_is_unchanged(self):
-        config = load_config(ROOT / "config/strategy.yaml")
-        path = locate_codex_config(config["codex"])
-        before = path.read_bytes()
-        for tools in STAGES.values():
-            self.command(tools)
-        self.assertEqual(path.read_bytes(), before)
+        with tempfile.TemporaryDirectory() as directory:
+            configured = Path(directory) / "config.toml"
+            configured.write_text('[mcp_servers.robinhood-trading]\nurl = "https://example.invalid/mcp"\n', encoding="utf-8")
+            path = locate_codex_config({"config_path": str(configured.resolve())})
+            before = path.read_bytes()
+            for tools in STAGES.values():
+                self.command(tools)
+            self.assertEqual(path.read_bytes(), before)
 
 
 if __name__ == "__main__":

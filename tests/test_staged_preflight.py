@@ -11,7 +11,7 @@ from unittest.mock import patch
 from orchestrator import ShadowOrchestrator
 from trader.codex_runner import CodexRunner
 from trader.models import CodexRunError, CodexRunResult, PreflightError, SchemaValidationError
-from trader.safety import derive_preflight_identity, load_config, validate_json
+from trader.safety import derive_preflight_identity, validate_json
 from trader.shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, ShadowBoundaryResult, locate_codex_config
 from trader.state import StateStore, initial_state
 
@@ -133,18 +133,20 @@ class StagedPreflightTests(unittest.TestCase):
         child.assert_not_called()
 
     def test_config_override_serialization_and_global_config_unchanged(self):
-        config = load_config(ROOT / "config/strategy.yaml")
-        config_path = locate_codex_config(config["codex"])
-        before = config_path.read_bytes()
-        runner = CodexRunner.__new__(CodexRunner)
-        runner.executable = "codex"
-        runner.project_root = ROOT
-        runner._shadow_boundary = ShadowBoundaryResult(config_path, "robinhood-trading", APPROVED_SHADOW_ROBINHOOD_TOOLS)
-        command = runner.build_command("gpt-5.6-luna", ROOT / "schemas/preflight-portfolio.schema.json", Path("/tmp/final.json"), allow_web=False, robinhood_enabled_tools=STAGE_TOOLS["portfolio"])
-        override = command[command.index("--config") + 1]
-        self.assertEqual(override, 'mcp_servers.robinhood-trading.enabled_tools=["get_accounts","get_portfolio"]')
-        self.assertIn("shell_tool", command)
-        self.assertEqual(config_path.read_bytes(), before)
+        with tempfile.TemporaryDirectory() as directory:
+            configured = Path(directory) / "config.toml"
+            configured.write_text('[mcp_servers.robinhood-trading]\nurl = "https://example.invalid/mcp"\n', encoding="utf-8")
+            config_path = locate_codex_config({"config_path": str(configured.resolve())})
+            before = config_path.read_bytes()
+            runner = CodexRunner.__new__(CodexRunner)
+            runner.executable = "codex"
+            runner.project_root = ROOT
+            runner._shadow_boundary = ShadowBoundaryResult(config_path, "robinhood-trading", APPROVED_SHADOW_ROBINHOOD_TOOLS)
+            command = runner.build_command("gpt-5.6-luna", ROOT / "schemas/preflight-portfolio.schema.json", Path("/tmp/final.json"), allow_web=False, robinhood_enabled_tools=STAGE_TOOLS["portfolio"])
+            override = command[command.index("--config") + 1]
+            self.assertEqual(override, 'mcp_servers.robinhood-trading.enabled_tools=["get_accounts","get_portfolio"]')
+            self.assertIn("shell_tool", command)
+            self.assertEqual(config_path.read_bytes(), before)
 
     def test_raw_account_identifier_rejected_and_never_reported(self):
         unsafe = {**payload("identity"), "account_id": "RAW-ACCOUNT-123"}
