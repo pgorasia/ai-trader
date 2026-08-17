@@ -32,3 +32,14 @@ class EquityMarketCalendar:
     def current_or_none(self, now: datetime | None = None) -> MarketSession | None:
         current = (now or datetime.now(ET)).astimezone(ET)
         return self.session_for(current.date())
+
+    def next_session(self, now: datetime | None = None) -> MarketSession:
+        """Return today's unfinished session or the next XNYS session."""
+        current = (now or datetime.now(ET)).astimezone(ET)
+        candidate = current.date()
+        for _ in range(370):
+            session = self.session_for(candidate)
+            if session is not None and current < session.eod_time:
+                return session
+            candidate += timedelta(days=1)
+        raise RuntimeError("XNYS calendar did not contain a future session")

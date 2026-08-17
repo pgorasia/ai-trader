@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
+import os
+import shutil
 import sys
 import time as time_module
 import unittest
@@ -27,10 +30,43 @@ from trader.safety import FORBIDDEN_ROBINHOOD_TOOLS, cooldown_until, derive_pref
 from trader.scheduler import SessionScheduler
 from trader.shadow_monitor import ShadowPlanMonitor
 from trader.state import STRATEGY_VERSION, StateStore
+from trader.automation import DaemonSupervisor, Heartbeat, health_check
+from trader.job_contracts import JOB_TOOL_CONTRACTS, validate_job_contracts
+from trader.operations import (complete as complete_operation, eligible as operation_eligible,
+    ensure_controls, fail as fail_operation, operation as find_operation, prepare as prepare_operation,
+    record_ai_failure, record_ai_success, start as start_operation)
+from trader.shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, locate_codex_config, verify_shadow_mcp_boundary
 
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "strategy.yaml"
+LOGGER = logging.getLogger("ai_trader")
+
+
+def audit(event: str, **values: Any) -> None:
+    fields = " ".join(f"{key}={sanitize_diagnostic_text(str(value))}" for key, value in values.items() if value is not None)
+    LOGGER.info("AI_TRADER event=%s%s", event, f" {fields}" if fields else "")
+
+
+def validate_unattended_config(root: Path = ROOT) -> dict[str, Any]:
+    """Local-only startup validation: no runner, child process, MCP, or network activity."""
+    config = load_config(root / "config" / "strategy.yaml")
+    offline_preflight(root, config)
+    problems = validate_job_contracts()
+    if config.get("mode") != "SHADOW": problems.append("configured mode is not SHADOW")
+    if len(APPROVED_SHADOW_ROBINHOOD_TOOLS) != 22: problems.append("global SHADOW tool boundary is not exactly 22 tools")
+    try: boundary = verify_shadow_mcp_boundary(locate_codex_config(config["codex"]))
+    except TraderError as exc: problems.append(sanitize_diagnostic_text(str(exc))); boundary = None
+    configured_executable = config["codex"].get("executable", "auto")
+    candidate = shutil.which("codex") if configured_executable in (None, "", "auto") else str(configured_executable)
+    resolved = Path(candidate).expanduser().resolve(strict=False) if candidate else None
+    if resolved is None or not resolved.is_file() or not os.access(resolved, os.X_OK):
+        problems.append("Codex executable is not locally resolvable")
+    return {"status": "PASS" if not problems else "FAIL", "mode": config.get("mode"),
+            "problems": problems, "required_approvals": sorted(set().union(*JOB_TOOL_CONTRACTS.values())),
+            "global_tool_count": len(APPROVED_SHADOW_ROBINHOOD_TOOLS),
+            "codex_executable": str(resolved) if resolved else None,
+            "robinhood_server": boundary.server_name if boundary else None}
 
 
 def aware(value: str) -> datetime:
@@ -56,6 +92,44 @@ class ShadowOrchestrator:
     def _trusted_now(self) -> datetime:
         clock = getattr(self, "clock", None)
         return (clock.now() if clock else datetime.now(ET)).astimezone(ET)
+
+    def _run_ai_job(self, state: dict[str, Any], *, operation_id: str, operation_type: str,
+                    scheduled_for: datetime, max_attempts: int = 1, **runner_args: Any):
+        now = self._trusted_now(); ensure_controls(state)
+        record = prepare_operation(state, operation_id, operation_type, scheduled_for, max_attempts)
+        circuit_open = state["ai_circuit"]["status"] == "OPEN"
+        if not operation_eligible(record, now, circuit_open):
+            raise PreflightError(f"AI operation is not eligible: {record['state']}")
+        start_operation(record, now)
+        counts = state["usage_counts"]
+        counts["codex_subprocess_attempts"] = counts.get("codex_subprocess_attempts", 0) + 1
+        audit(f"{operation_type}_START" if operation_type != "STAGE_B" else "CYCLE_START",
+              operation_id=operation_id, attempt=record["attempt_number"])
+        self.store.save(state)
+        try:
+            result = self.runner.run(**runner_args)
+        except CodexRunError as exc:
+            ended = self._trusted_now(); counts["codex_failed_attempts"] = counts.get("codex_failed_attempts", 0) + 1
+            if operation_type == "EOD": counts["eod_failed_attempts"] = counts.get("eod_failed_attempts", 0) + 1
+            if operation_type == "STAGE_B": counts["stage_b_failed_slots"] = counts.get("stage_b_failed_slots", 0) + 1
+            decision = fail_operation(record, exc, ended, self.runner.safe_diagnostics())
+            opened = record_ai_failure(state, exc, ended,
+                int(self.config.get("circuit_breaker", {}).get("consecutive_failures", 3)),
+                int(self.config.get("circuit_breaker", {}).get("total_failures", 5)))
+            if opened:
+                counts["session_circuit_breaker_trips"] = counts.get("session_circuit_breaker_trips", 0) + 1
+                audit("SESSION_CIRCUIT_OPEN", failures=state["ai_circuit"]["failure_count"])
+            self.store.save(state)
+            audit("CYCLE_FAILED" if operation_type == "STAGE_B" else f"{operation_type}_FAILED",
+                  operation_id=operation_id, error_class=type(exc).__name__, decision=decision)
+            raise
+        complete_operation(record, self._trusted_now()); record_ai_success(state)
+        if operation_type == "STAGE_B": counts["stage_b_completed_runs"] = counts.get("stage_b_completed_runs", 0) + 1
+        elif operation_type == "SOL": counts["sol_completed_runs"] = counts.get("sol_completed_runs", 0) + 1
+        elif operation_type == "MONITOR": counts["monitor_completed_runs"] = counts.get("monitor_completed_runs", 0) + 1
+        elif operation_type == "EOD": counts["eod_completed_runs"] = counts.get("eod_completed_runs", 0) + 1
+        self.store.save(state)
+        return result
 
     def preflight(self, state: dict[str, Any], now: datetime, *, operation_id: str | None = None) -> dict[str, Any]:
         self._ensure_strategy_version(state)
@@ -101,10 +175,10 @@ class ShadowOrchestrator:
             boundary = self.boundary
             context = {"mode": "SHADOW", "requested_timestamp": now.astimezone(ET).isoformat(), "deterministic_boundary_policy": boundary.policy_version}
             stages = (
-                ("identity", "identity_job", "preflight.md", "preflight.schema.json", frozenset({"get_accounts"})),
-                ("portfolio", "portfolio_job", "preflight-portfolio.md", "preflight-portfolio.schema.json", frozenset({"get_accounts", "get_portfolio"})),
-                ("positions", "positions_job", "preflight-positions.md", "preflight-positions.schema.json", frozenset({"get_accounts", "get_equity_positions"})),
-                ("orders", "orders_job", "preflight-orders.md", "preflight-orders.schema.json", frozenset({"get_accounts", "get_equity_orders"})),
+                ("identity", "identity_job", "preflight.md", "preflight.schema.json", JOB_TOOL_CONTRACTS["PREFLIGHT_IDENTITY"]),
+                ("portfolio", "portfolio_job", "preflight-portfolio.md", "preflight-portfolio.schema.json", JOB_TOOL_CONTRACTS["PREFLIGHT_PORTFOLIO"]),
+                ("positions", "positions_job", "preflight-positions.md", "preflight-positions.schema.json", JOB_TOOL_CONTRACTS["PREFLIGHT_POSITIONS"]),
+                ("orders", "orders_job", "preflight-orders.md", "preflight-orders.schema.json", JOB_TOOL_CONTRACTS["PREFLIGHT_ORDERS"]),
             )
             selected_classification = None
             for stage, report_key, prompt_name, schema_name, expected_tools in stages:
@@ -117,6 +191,7 @@ class ShadowOrchestrator:
                     required_robinhood_tools=expected_tools,
                     allow_web=False,
                     robinhood_enabled_tools=expected_tools,
+                    exact_robinhood_tools=True,
                 )
                 job_results.append(child)
                 diagnostics = child.diagnostics or self.runner.safe_diagnostics()
@@ -207,13 +282,14 @@ class ShadowOrchestrator:
             "cooldowns_and_prior_rejections": cooldown_context,
             "active_shadow_plan_count": self._active_plan_count(state),
         }
-        result = self.runner.run(
+        result = self._run_ai_job(state, operation_id=f"stage_b:{scheduled_for.isoformat()}", operation_type="STAGE_B",
+            scheduled_for=scheduled_for,
             prompt_path=self.root / "prompts" / "luna-stage-b.md",
             schema_path=self.root / "schemas" / "luna-cycle.schema.json",
             model=self.config["models"]["luna"],
             context=context,
             required_robinhood_tools=frozenset({"get_accounts", "get_portfolio", "get_equity_orders", "get_equity_positions", "run_scan"}),
-            allow_web=False,
+            allow_web=False, robinhood_enabled_tools=JOB_TOOL_CONTRACTS["STAGE_B"],
         )
         luna_ended = self._trusted_now()
         cycle = result.data
@@ -271,11 +347,13 @@ class ShadowOrchestrator:
                 "risk": self.config["risk"],
                 "immutable_prior_rejections": self._cooldown_context(state, aware(cycle["timestamp"])),
             }
-            result = self.runner.run(
+            result = self._run_ai_job(state, operation_id=decision_operation, operation_type="SOL",
+                scheduled_for=sol_started,
                 prompt_path=self.root / "prompts" / "sol-senior.md",
                 schema_path=self.root / "schemas" / "senior-decision.schema.json",
                 model=self.config["models"]["sol"], reasoning_effort=self.config["models"]["sol_reasoning_effort"],
-                context=context, required_robinhood_tools=frozenset({"get_equity_quotes", "get_equity_historicals"}), allow_web=True,
+                context=context, required_robinhood_tools=JOB_TOOL_CONTRACTS["SOL_SENIOR"], allow_web=True,
+                robinhood_enabled_tools=JOB_TOOL_CONTRACTS["SOL_SENIOR"],
             )
             sol_ended = self._trusted_now()
             decision = result.data
@@ -328,13 +406,13 @@ class ShadowOrchestrator:
             "timestamp": now.astimezone(ET).isoformat(),
             "plans": [{"plan_id": item["plan_id"], "symbol": item["original_plan"]["symbol"], "start_time": item["original_plan"]["decision_timestamp"]} for item in active],
         }
-        result = self.runner.run(
+        result = self._run_ai_job(state, operation_id=monitor_operation, operation_type="MONITOR", scheduled_for=now,
             prompt_path=self.root / "prompts" / "shadow-monitor.md",
             schema_path=self.root / "schemas" / "shadow-monitor.schema.json",
             model=self.config["models"]["luna"],
             context=context,
-            required_robinhood_tools=frozenset({"get_equity_historicals"}),
-            allow_web=False,
+            required_robinhood_tools=JOB_TOOL_CONTRACTS["MONITOR"],
+            allow_web=False, robinhood_enabled_tools=JOB_TOOL_CONTRACTS["MONITOR"],
         )
         if result.diagnostics.get("mcp_teardown_warning"):
             state.setdefault("runtime_diagnostics", []).append({"operation_id": monitor_operation, **result.diagnostics})
@@ -360,6 +438,11 @@ class ShadowOrchestrator:
 
     def eod(self, state: dict[str, Any], session) -> dict[str, Any]:
         eod_operation = f"eod:{state['session_date']}"
+        ensure_controls(state)
+        persisted = find_operation(state, eod_operation)
+        if state["ai_circuit"]["status"] == "OPEN" or (persisted and persisted.get("state") == "FAILED_TERMINAL"):
+            return self._finalize_eod_without_ai(state, session,
+                "SKIPPED_CIRCUIT_OPEN" if state["ai_circuit"]["status"] == "OPEN" else "SKIPPED_AI_FAILED_TERMINAL")
         if eod_operation in state["operation_ids"]:
             if not state.get("eod_completed") or not isinstance(state.get("eod_review"), dict):
                 raise StateCorruptionError("Persisted EOD operation has incomplete provenance")
@@ -374,13 +457,14 @@ class ShadowOrchestrator:
             "senior_decisions": [{key: value for key, value in item.items() if key not in {"cli_usage", "cli_tool_calls"}} for item in state["senior_decisions"]],
             "shadow_plans": state["shadow_plans"],
         }
-        result = self.runner.run(
+        result = self._run_ai_job(state, operation_id=eod_operation, operation_type="EOD",
+            scheduled_for=session.eod_time, max_attempts=3,
             prompt_path=self.root / "prompts" / "eod-review.md",
             schema_path=self.root / "schemas" / "eod-review.schema.json",
             model=self.config["models"]["luna"],
             context=context,
-            required_robinhood_tools=frozenset({"get_equity_historicals"}),
-            allow_web=False,
+            required_robinhood_tools=JOB_TOOL_CONTRACTS["EOD"],
+            allow_web=False, robinhood_enabled_tools=JOB_TOOL_CONTRACTS["EOD"],
         )
         review = result.data
         review["cli_diagnostics"] = result.diagnostics
@@ -422,6 +506,23 @@ class ShadowOrchestrator:
         self._write_experiment_report(state["session_date"], readiness)
         return companion
 
+    def _finalize_eod_without_ai(self, state: dict[str, Any], session, status: str) -> dict[str, Any]:
+        operation_id = f"eod:{state['session_date']}"
+        record = prepare_operation(state, operation_id, "EOD", session.eod_time, 3)
+        if record["state"] not in {"COMPLETED", "FAILED_TERMINAL"}:
+            record.update({"state": "FAILED_TERMINAL", "completed_at": self._trusted_now().isoformat(), "next_retry_at": None})
+        review = {"session_date": state["session_date"], "status": status,
+                  "failure_summary": {"errors": len(state.get("errors", [])),
+                                      "ai_failures": state.get("ai_circuit", {}).get("failure_count", 0)},
+                  "metrics_retained": True}
+        state.update({"eod_completed": True, "eod_review": review, "session_terminal": True})
+        if operation_id not in state["operation_ids"]: state["operation_ids"].append(operation_id)
+        state["usage_counts"]["eod_completed_runs"] = state["usage_counts"].get("eod_completed_runs", 0) + 1
+        self.store.save(state); audit("SESSION_COMPLETE", eod=status)
+        return {"session_date": state["session_date"], "agent_review": review,
+                "shadow_plans": state["shadow_plans"], "completed_shadow_trades": state["completed_shadow_trades"],
+                "research_outcomes": state.get("research_outcomes", []), "readiness": state.get("readiness")}
+
     def run_once(self, now: datetime | None = None) -> dict[str, Any]:
         current = (now or datetime.now(ET)).astimezone(ET)
         session = self.calendar.session_for(current.date())
@@ -447,7 +548,7 @@ class ShadowOrchestrator:
         self.store.save(state)
         return cycle
 
-    def run_session(self, now: datetime | None = None) -> None:
+    def run_session(self, now: datetime | None = None, *, preflight_already_passed: bool = False) -> None:
         current = (now or datetime.now(ET)).astimezone(ET)
         session = self.calendar.session_for(current.date())
         if session is None:
@@ -455,8 +556,11 @@ class ShadowOrchestrator:
             return
         state = self.store.load(session.session_date)
         self._regenerate_cycle_reports(state)
-        self.preflight(state, current)
-        self.store.save(state)
+        if not preflight_already_passed:
+            self.preflight(state, current)
+            self.store.save(state)
+        elif not any(item.get("status") == "COMPLETED" for item in state.get("preflight_operations", [])):
+            raise PreflightError("Session research requires a completed preflight")
         completed_slots = {item.get("scheduled_for") for item in state["cycles"]}
         remaining_slots = [slot for slot in self.scheduler.scan_times(session) if slot.isoformat() not in completed_slots]
         stale_initial = [slot for slot in remaining_slots if self.scheduler.is_stale(slot, current)]
@@ -495,12 +599,25 @@ class ShadowOrchestrator:
                 self.store.save(state)
         self._wait_until(session.eod_time)
         if not state.get("eod_completed"):
+            persisted_eod = find_operation(state, f"eod:{state['session_date']}")
+            if persisted_eod and persisted_eod.get("state") == "RETRY_WAIT" and persisted_eod.get("next_retry_at"):
+                retry_at = aware(persisted_eod["next_retry_at"])
+                audit("EOD_RETRY", next_retry_at=retry_at.isoformat())
+                self._wait_until(retry_at)
             timing_operation = f"eod-timing:{state['session_date']}"
             if timing_operation not in state["operation_ids"]:
                 state["schedule_events"].append({"operation_id": timing_operation, "status": "EOD_STARTED", "scheduled_for": session.eod_time.isoformat(), "observed_at": self._trusted_now().isoformat()})
                 state["operation_ids"].append(timing_operation)
                 self.store.save(state)
-            self.eod(state, session)
+            try:
+                self.eod(state, session)
+            except CodexRunError:
+                persisted_eod = find_operation(state, f"eod:{state['session_date']}")
+                if persisted_eod and persisted_eod.get("state") == "FAILED_TERMINAL":
+                    audit("EOD_FAILED_TERMINAL")
+                    self._finalize_eod_without_ai(state, session, "SKIPPED_AI_FAILED_TERMINAL")
+                    return
+                raise
 
     def run_eod_only(self, day: datetime | None = None) -> dict[str, Any]:
         current = (day or datetime.now(ET)).astimezone(ET)
@@ -808,10 +925,19 @@ class ShadowOrchestrator:
 
     def _wait_until(self, target: datetime) -> None:
         while True:
+            stop_event = getattr(self, "stop_event", None)
+            if stop_event is not None and stop_event.is_set():
+                raise SystemExit(0)
             remaining = (target - self._trusted_now()).total_seconds()
             if remaining <= 0:
                 return
-            time_module.sleep(min(30, remaining))
+            callback = getattr(self, "heartbeat_callback", None)
+            if callback is not None:
+                callback(target)
+            if stop_event is not None:
+                stop_event.wait(min(30, remaining))
+            else:
+                time_module.sleep(min(30, remaining))
 
 
 def run_self_test() -> bool:
@@ -831,19 +957,39 @@ def parser() -> argparse.ArgumentParser:
     group.add_argument("--run-session", action="store_true")
     group.add_argument("--eod", action="store_true")
     group.add_argument("--status", action="store_true")
+    group.add_argument("--daemon", action="store_true")
+    group.add_argument("--health-check", action="store_true")
+    group.add_argument("--validate-unattended-config", action="store_true")
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parser().parse_args(argv)
     if args.self_test:
         return 0 if run_self_test() else 1
+    if args.health_check:
+        problems = health_check(ROOT)
+        if problems:
+            print(json.dumps({"status": "UNHEALTHY", "problems": problems}, indent=2), file=sys.stderr)
+            return 3
+        print(json.dumps({"status": "HEALTHY", "mode": "SHADOW"}, indent=2))
+        return 0
+    if args.validate_unattended_config:
+        result = validate_unattended_config(ROOT)
+        print(json.dumps(result, indent=2), file=sys.stdout if result["status"] == "PASS" else sys.stderr)
+        return 0 if result["status"] == "PASS" else 2
     try:
         started_at = datetime.now(ET)
         lock = SingleInstanceLock(ROOT / ".runtime" / "orchestrator.lock", started_at.date().isoformat(), started_at)
         with lock:
             orchestrator = ShadowOrchestrator()
-            if args.status:
+            if args.daemon:
+                validation = validate_unattended_config(ROOT)
+                if validation["status"] != "PASS":
+                    raise PreflightError("Unattended configuration invalid: " + "; ".join(validation["problems"]))
+                DaemonSupervisor(orchestrator, heartbeat=Heartbeat(ROOT / "state" / "heartbeat.json", ROOT)).run_forever()
+            elif args.status:
                 print(json.dumps(orchestrator.status(), indent=2, default=str))
             elif args.preflight:
                 now = orchestrator._trusted_now()

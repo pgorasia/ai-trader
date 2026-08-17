@@ -1,0 +1,25 @@
+[Unit]
+Description=AI Trader unattended SHADOW supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/projects/ai-trader
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.venvs/ai-trader/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=/home/ubuntu/.venvs/ai-trader/bin/python -m trader.maintenance --record-service-start
+ExecStart=/home/ubuntu/.venvs/ai-trader/bin/python /home/ubuntu/projects/ai-trader/orchestrator.py --daemon
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=90s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/projects/ai-trader
+
+[Install]
+WantedBy=multi-user.target

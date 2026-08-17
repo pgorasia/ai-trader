@@ -82,7 +82,7 @@ def locate_codex_config(codex_settings: Mapping[str, Any], environment: Mapping[
     return (base / "config.toml").resolve(strict=False)
 
 
-def verify_shadow_mcp_boundary(config_path: Path) -> ShadowBoundaryResult:
+def verify_shadow_mcp_boundary(config_path: Path, *, require_unattended_approvals: bool = True) -> ShadowBoundaryResult:
     try:
         raw = config_path.read_text(encoding="utf-8")
         config = tomllib.loads(raw)
@@ -112,16 +112,21 @@ def verify_shadow_mcp_boundary(config_path: Path) -> ShadowBoundaryResult:
     missing = sorted(REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS - enabled)
     if missing:
         raise PreflightError(f"Robinhood preflight unavailable; required read tools missing: {', '.join(missing)}")
+    from .job_contracts import UNATTENDED_APPROVAL_TOOLS
+    required_approvals = UNATTENDED_APPROVAL_TOOLS if require_unattended_approvals else REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS
+    unavailable = sorted(required_approvals - enabled)
+    if unavailable:
+        raise PreflightError("Robinhood unattended scheduled tools are not globally enabled: " + ", ".join(unavailable))
     tool_settings = server.get("tools")
     if not isinstance(tool_settings, dict):
         raise PreflightError("Robinhood unattended preflight approvals are not configured")
     unapproved = sorted(
-        name for name in REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS
+        name for name in required_approvals
         if not isinstance(tool_settings.get(name), dict)
         or tool_settings[name].get("approval_mode") != "approve"
     )
     if unapproved:
         raise PreflightError(
-            "Robinhood unattended preflight read approvals are missing: " + ", ".join(unapproved)
+            "Robinhood unattended explicit tool approvals are missing: " + ", ".join(unapproved)
         )
     return ShadowBoundaryResult(config_path.resolve(), str(server_name), enabled)

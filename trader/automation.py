@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from .market_calendar import ET
+from .maintenance import LocalMaintenanceController
+from .models import TraderError
+from .state import atomic_write_json, validate_state_shape
+
+HEARTBEAT_SCHEMA_VERSION = 1
+HEARTBEAT_MAX_AGE = timedelta(minutes=3)
+LOGGER = logging.getLogger("ai_trader")
+
+
+def _audit(event: str, **values: Any) -> None:
+    LOGGER.info("AI_TRADER event=%s%s", event, "".join(f" {key}={value}" for key, value in values.items()))
+
+
+def git_commit(root: Path) -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "UNKNOWN"
+
+
+class Heartbeat:
+    def __init__(self, path: Path, root: Path, pid: int | None = None) -> None:
+        self.path, self.root, self.pid = path, root, pid or os.getpid()
+        self.values: dict[str, Any] = {
+            "version": HEARTBEAT_SCHEMA_VERSION, "timestamp": "", "daemon_pid": self.pid,
+            "mode": "SHADOW", "lifecycle_state": "STARTING",
+            "last_preflight": None, "last_cycle": None,
+            "last_eod": None, "next_scheduled_action": None,
+            "last_local_health_check": None, "last_local_test_result": None,
+            "git_commit": git_commit(root),
+        }
+
+    def update(self, lifecycle_state: str, next_action: datetime | None = None, **values: Any) -> None:
+        self.values.update(values)
+        self.values.update({
+            "timestamp": datetime.now(timezone.utc).isoformat(), "daemon_pid": self.pid,
+            "mode": "SHADOW", "lifecycle_state": lifecycle_state,
+            "next_scheduled_action": next_action.isoformat() if next_action else None,
+        })
+        atomic_write_json(self.path, self.values)
+
+
+class DaemonSupervisor:
+    """Calendar-driven, interruptibly sleeping wrapper around Shadow sessions."""
+    def __init__(self, orchestrator: Any, *, stop_event: threading.Event | None = None,
+                 heartbeat: Heartbeat | None = None, preflight_lead_minutes: int = 10,
+                 heartbeat_seconds: int = 60, local_maintenance: LocalMaintenanceController | None = None) -> None:
+        self.orchestrator = orchestrator
+        self.calendar = orchestrator.calendar
+        self.stop_event = stop_event or threading.Event()
+        self.heartbeat = heartbeat or Heartbeat(orchestrator.root / "state" / "heartbeat.json", orchestrator.root)
+        self.preflight_lead_minutes = preflight_lead_minutes
+        self.heartbeat_seconds = heartbeat_seconds
+        self.local_maintenance = local_maintenance or LocalMaintenanceController(
+            orchestrator.root, python="/home/ubuntu/.venvs/ai-trader/bin/python"
+        )
+
+    def install_signal_handlers(self) -> None:
+        def stop(_signum: int, _frame: Any) -> None:
+            self.stop_event.set()
+            self.heartbeat.update("SHUTTING_DOWN")
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+
+    def wait_until(self, target: datetime, lifecycle: str) -> bool:
+        while not self.stop_event.is_set():
+            remaining = (target - self.orchestrator._trusted_now()).total_seconds()
+            if remaining <= 0:
+                return True
+            self._run_local_maintenance()
+            self.heartbeat.update(lifecycle, target)
+            self.stop_event.wait(min(float(self.heartbeat_seconds), remaining))
+        return False
+
+    def run_forever(self) -> None:
+        self.install_signal_handlers()
+        self.orchestrator.stop_event = self.stop_event
+        self.orchestrator.heartbeat_callback = self._session_heartbeat
+        _audit("DAEMON_STARTED", mode="SHADOW")
+        while not self.stop_event.is_set():
+            now = self.orchestrator._trusted_now()
+            session = self._session_to_run(now)
+            preflight_at = session.market_open - timedelta(minutes=self.preflight_lead_minutes)
+            if now < preflight_at and not self.wait_until(preflight_at, "WAITING_FOR_PREFLIGHT"):
+                break
+            if self.stop_event.is_set():
+                break
+            state = self.orchestrator.store.load(session.session_date)
+            terminal = [item for item in state.get("preflight_operations", [])
+                        if item.get("status") in {"COMPLETED", "FAILED"}]
+            if any(item["status"] == "FAILED" for item in terminal):
+                self.heartbeat.update("SESSION_FAILED_CLOSED", session.eod_time)
+                self.wait_until(session.eod_time + timedelta(seconds=1), "SESSION_FAILED_CLOSED")
+                continue
+            try:
+                if not any(item["status"] == "COMPLETED" for item in terminal):
+                    _audit("PREFLIGHT_START", session=session.session_date)
+                    self.heartbeat.update("PREFLIGHT_RUNNING")
+                    started = [item for item in state.get("preflight_operations", [])
+                               if item.get("status") == "STARTED"]
+                    operation_id = started[-1]["operation_id"] if started else None
+                    self.orchestrator.preflight(state, self.orchestrator._trusted_now(),
+                                                operation_id=operation_id)
+                    self.orchestrator.store.save(state)
+                    _audit("PREFLIGHT_PASS", session=session.session_date)
+                passed = self.orchestrator._trusted_now().isoformat()
+                self.heartbeat.update("SESSION_RUNNING", last_preflight=passed)
+                self.orchestrator.run_session(preflight_already_passed=True)
+                completed = self.orchestrator.store.load(session.session_date, create=False)
+                last_cycle = completed["cycles"][-1].get("timestamp") if completed["cycles"] else None
+                last_eod = completed.get("updated_at") if completed.get("eod_completed") else None
+                self.heartbeat.update("SESSION_COMPLETE", last_cycle=last_cycle, last_eod=last_eod)
+                _audit("SESSION_COMPLETE", session=session.session_date)
+            except (TraderError, OSError, ValueError) as exc:
+                self.local_maintenance.record_application_failure(
+                    "DAEMON_SESSION", type(exc).__name__
+                )
+                try:
+                    failed = self.orchestrator.store.load(session.session_date, create=False)
+                    failed.setdefault("errors", []).append({
+                        "timestamp": self.orchestrator._trusted_now().isoformat(),
+                        "category": "DAEMON_SESSION", "message": type(exc).__name__, "resolved": False,
+                    })
+                    self.orchestrator.store.save(failed)
+                except (TraderError, OSError, ValueError):
+                    pass
+                self.heartbeat.update("SESSION_FAILED_CLOSED", session.eod_time)
+                self.wait_until(session.eod_time + timedelta(seconds=1), "SESSION_FAILED_CLOSED")
+        self.heartbeat.update("STOPPED")
+
+    def _session_heartbeat(self, next_action: datetime) -> None:
+        self._run_local_maintenance()
+        self.heartbeat.update("SESSION_RUNNING", next_action)
+
+    def _run_local_maintenance(self) -> None:
+        try:
+            results = self.local_maintenance.run_due()
+            if not results:
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            values: dict[str, Any] = {"last_local_health_check": now}
+            tests = [results[name] for name in ("six_hour", "daily") if name in results]
+            if tests:
+                values["last_local_test_result"] = {
+                    "timestamp": now, "passed": all(item["ok"] for item in tests),
+                }
+            self.heartbeat.update("LOCAL_MAINTENANCE", **values)
+        except (OSError, ValueError, TraderError):
+            self.heartbeat.update("LOCAL_MAINTENANCE_FAILED",
+                                  last_local_health_check=datetime.now(timezone.utc).isoformat())
+
+    def _session_to_run(self, now: datetime):
+        """Recover a passed-preflight session whose EOD was missed by a reboot."""
+        today = self.calendar.session_for(now.astimezone(ET).date())
+        if today is not None and now >= today.eod_time:
+            path = self.orchestrator.store.path_for(today.session_date)
+            if path.exists():
+                state = self.orchestrator.store.load(today.session_date, create=False)
+                passed = any(item.get("status") == "COMPLETED"
+                             for item in state.get("preflight_operations", []))
+                failed = any(item.get("status") == "FAILED"
+                             for item in state.get("preflight_operations", []))
+                if passed and not failed and not state.get("eod_completed"):
+                    from .operations import eligible, operation
+                    record = operation(state, f"eod:{today.session_date}")
+                    circuit_open = state.get("ai_circuit", {}).get("status") == "OPEN"
+                    # A past timestamp is insufficient: persisted state must
+                    # explicitly permit this operation now, or local EOD must
+                    # be needed because the circuit is open.
+                    if circuit_open or record is None or record.get("state") == "RETRY_WAIT" or eligible(record, now, False):
+                        return today
+        return self.calendar.next_session(now)
+
+
+def health_check(root: Path, *, now: datetime | None = None,
+                 max_age: timedelta = HEARTBEAT_MAX_AGE) -> list[str]:
+    """Offline health assessment; never constructs a Codex/Robinhood runner."""
+    problems: list[str] = []
+    heartbeat: dict[str, Any] = {}
+    try:
+        heartbeat = json.loads((root / "state" / "heartbeat.json").read_text(encoding="utf-8"))
+        required = {"version", "timestamp", "daemon_pid", "mode", "lifecycle_state", "git_commit",
+                    "last_preflight", "last_cycle", "last_eod", "last_local_health_check",
+                    "last_local_test_result", "next_scheduled_action"}
+        if not isinstance(heartbeat, dict) or not required <= heartbeat.keys() or heartbeat["version"] != HEARTBEAT_SCHEMA_VERSION:
+            raise ValueError("invalid heartbeat schema")
+        stamp = datetime.fromisoformat(heartbeat["timestamp"].replace("Z", "+00:00"))
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        if current - stamp.astimezone(timezone.utc) > max_age:
+            problems.append("heartbeat is stale")
+        if heartbeat.get("mode") != "SHADOW":
+            problems.append("heartbeat mode is not SHADOW")
+        pid = int(heartbeat["daemon_pid"])
+        if pid <= 0:
+            raise ValueError("invalid daemon pid")
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        problems.append("daemon pid is not running")
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        problems.append(f"heartbeat invalid: {type(exc).__name__}")
+    try:
+        lock = json.loads((root / ".runtime" / "orchestrator.lock").read_text(encoding="utf-8"))
+        if int(lock.get("pid", -1)) != int(heartbeat.get("daemon_pid", -2)):
+            problems.append("lock owner differs from daemon")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        problems.append("lock metadata invalid")
+    try:
+        import yaml
+        config = yaml.safe_load((root / "config" / "strategy.yaml").read_text(encoding="utf-8"))
+        if config.get("mode") != "SHADOW":
+            problems.append("configured mode is not SHADOW")
+    except (OSError, ValueError, AttributeError):
+        problems.append("strategy configuration unavailable")
+    try:
+        for path in (root / "orchestrator.py", root / "trader" / "shadow_boundary.py", root / "AGENTS.md"):
+            if not path.is_file():
+                problems.append(f"required file missing: {path.name}")
+        for path in (root / "state").glob("????-??-??.json"):
+            validate_state_shape(json.loads(path.read_text(encoding="utf-8")), path.stem)
+    except (OSError, ValueError, json.JSONDecodeError, TraderError):
+        problems.append("state integrity check failed")
+    usage = shutil.disk_usage(root)
+    if usage.free / max(usage.total, 1) < 0.05:
+        problems.append("disk critically full")
+    if shutil.which("codex") is None:
+        problems.append("Codex executable is not resolvable")
+    return problems

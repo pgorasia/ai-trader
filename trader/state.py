@@ -48,9 +48,18 @@ def initial_state(session_date: str, timezone_name: str = "America/New_York", no
         "version": STATE_SCHEMA_VERSION, "revision": 0, "mode": "SHADOW", "session_date": session_date,
         "strategy_version": STRATEGY_VERSION,
         "created_at": stamp, "updated_at": stamp, "cooldowns": {},
-        "usage_counts": {"luna_runs": 0, "sol_runs": 0, "preflight_runs": 0, "monitor_runs": 0, "eod_runs": 0, "robinhood_tool_calls": 0, "web_searches": 0, "failed_runs": 0, "tokens": {}},
+        "usage_counts": {"luna_runs": 0, "sol_runs": 0, "preflight_runs": 0, "monitor_runs": 0, "eod_runs": 0,
+                         "codex_subprocess_attempts": 0, "codex_failed_attempts": 0,
+                         "stage_b_completed_runs": 0, "stage_b_failed_slots": 0,
+                         "sol_completed_runs": 0, "monitor_completed_runs": 0,
+                         "eod_completed_runs": 0, "eod_failed_attempts": 0,
+                         "session_circuit_breaker_trips": 0,
+                         "robinhood_tool_calls": 0, "web_searches": 0, "failed_runs": 0, "tokens": {}},
         "eod_completed": False,
         "preflight_operations": [],
+        "ai_operations": [],
+        "ai_circuit": {"status": "CLOSED", "circuit_opened_at": None, "reason": None,
+                       "consecutive_failures": 0, "failure_count": 0, "last_failure_fingerprint": None},
     }
     for field in STATE_LIST_FIELDS:
         state[field] = []
@@ -104,6 +113,17 @@ def validate_state_shape(state: Any, expected_date: str | None = None) -> None:
             raise StateCorruptionError("Terminal preflight lacks a completion timestamp")
         if item.get("completed_at"):
             _aware(item["completed_at"], "preflight completed_at")
+    operations = state.get("ai_operations", [])
+    if not isinstance(operations, list) or len({item.get("operation_id") for item in operations if isinstance(item, dict)}) != len(operations):
+        raise StateCorruptionError("Invalid AI operation metadata")
+    for item in operations:
+        if item.get("state") not in {"PENDING", "STARTED", "RETRY_WAIT", "COMPLETED", "FAILED_TERMINAL"}:
+            raise StateCorruptionError("Invalid AI operation state")
+        _aware(item.get("scheduled_for"), "AI operation scheduled_for")
+        if item.get("next_retry_at"): _aware(item["next_retry_at"], "AI operation next_retry_at")
+    circuit = state.get("ai_circuit", {"status": "CLOSED"})
+    if not isinstance(circuit, dict) or circuit.get("status") not in {"CLOSED", "OPEN"}:
+        raise StateCorruptionError("Invalid session AI circuit")
     _unique_ids(state["cycles"], "cycle_id", "cycle")
     _unique_ids(state["senior_decisions"], "source_cycle_id", "senior decision")
     _unique_ids(state["shadow_plans"], "plan_id", "plan")

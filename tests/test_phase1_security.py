@@ -15,6 +15,7 @@ from trader.shadow_boundary import (
     REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS,
     verify_shadow_mcp_boundary,
 )
+from trader.job_contracts import UNATTENDED_APPROVAL_TOOLS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +27,7 @@ def config_text(tools: set[str], *, second: bool = False) -> str:
     extra = '\n[mcp_servers."another-robinhood"]\nenabled_tools = ["get_accounts"]\n' if second else ""
     approvals = "".join(
         f'\n[mcp_servers."robinhood-trading".tools.{name}]\napproval_mode = "approve"\n'
-        for name in sorted(REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS)
+        for name in sorted(UNATTENDED_APPROVAL_TOOLS)
     )
     return f'[mcp_servers."robinhood-trading"]\nenabled_tools = [{quoted}]\n{approvals}{extra}'
 
@@ -42,9 +43,9 @@ class ShadowBoundaryTests(unittest.TestCase):
         result = self.verify(config_text(set(APPROVED_SHADOW_ROBINHOOD_TOOLS)))
         self.assertEqual(result.enabled_tools, APPROVED_SHADOW_ROBINHOOD_TOOLS)
 
-    def test_safe_subset_with_required_reads_passes(self):
-        result = self.verify(config_text(set(REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS)))
-        self.assertEqual(result.enabled_tools, REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS)
+    def test_safe_subset_without_scheduled_tools_fails(self):
+        with self.assertRaises(PreflightError):
+            self.verify(config_text(set(REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS)))
 
     def test_known_forbidden_tool_fails(self):
         with self.assertRaises(PreflightError):
@@ -67,7 +68,7 @@ class ShadowBoundaryTests(unittest.TestCase):
             self.verify('[mcp_servers."robinhood-trading"]\ncommand="server"')
 
     def test_missing_unattended_read_approval_fails_clearly(self):
-        content = config_text(set(REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS)).replace(
+        content = config_text(set(APPROVED_SHADOW_ROBINHOOD_TOOLS)).replace(
             '\n[mcp_servers."robinhood-trading".tools.get_portfolio]\napproval_mode = "approve"\n',
             "",
         )
@@ -75,7 +76,7 @@ class ShadowBoundaryTests(unittest.TestCase):
             self.verify(content)
 
     def test_non_approve_read_mode_fails_clearly(self):
-        content = config_text(set(REQUIRED_PREFLIGHT_ROBINHOOD_TOOLS)).replace(
+        content = config_text(set(APPROVED_SHADOW_ROBINHOOD_TOOLS)).replace(
             '[mcp_servers."robinhood-trading".tools.get_equity_orders]\napproval_mode = "approve"',
             '[mcp_servers."robinhood-trading".tools.get_equity_orders]\napproval_mode = "prompt"',
         )

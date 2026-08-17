@@ -49,6 +49,10 @@ risk:
 cooldown:
   senior_rejection_minutes: 30
 
+circuit_breaker:
+  consecutive_failures: 3
+  total_failures: 5
+
 experiment:
   maximum_research_candidates_per_session: 4
   development_sessions: 15

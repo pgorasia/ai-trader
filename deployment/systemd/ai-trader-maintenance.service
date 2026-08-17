@@ -1,0 +1,16 @@
+[Unit]
+Description=AI Trader isolated SHADOW-only maintenance
+After=network-online.target ai-trader.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/projects/ai-trader
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.venvs/ai-trader/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/ubuntu/.venvs/ai-trader/bin/python -m trader.maintenance --local --process-ai-queue
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/projects/ai-trader -/home/ubuntu/projects/ai-trader-maintenance /home/ubuntu/ai-trader-backups

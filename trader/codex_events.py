@@ -17,7 +17,7 @@ KNOWN_ITEM_NON_TOOL_TYPES = frozenset({"agent_message", "reasoning", "message", 
 KNOWN_TOOL_ITEM_TYPES = frozenset({"mcp_tool_call", "web_search", "function_call", "tool_call", "command_execution"})
 EXPECTED_PREFLIGHT_TOOLS = ("get_accounts", "get_portfolio", "get_equity_orders", "get_equity_positions")
 _SECRET_TEXT = re.compile(
-    r"(?i)(bearer\s+)[^\s,;\"']+|((?:session[_ -]?id|oauth[_ -]?token|authorization|cookie|brokerage[_ -]?account[_ -]?id|account[_ -]?(?:number|id))\s*[:=]\s*)[^\s,;]+|([?&](?:token|key|secret|code)=)[^&\s]+|()\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
+    r"(?i)(bearer\s+)[^\s,;\"']+|((?:session[_ -]?id|oauth[_ -]?token|token|authorization|cookie|brokerage[_ -]?account[_ -]?id|account[_ -]?(?:number|id))\s*[:=]\s*)[^\s,;]+|([?&](?:token|key|secret|code)=)[^&\s]+|()\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
 )
 
 

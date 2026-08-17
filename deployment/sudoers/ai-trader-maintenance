@@ -1,0 +1,3 @@
+# Narrow privilege needed only for atomic stop/start around a validated promotion.
+ubuntu ALL=(root) NOPASSWD: /usr/bin/systemctl stop ai-trader.service
+ubuntu ALL=(root) NOPASSWD: /usr/bin/systemctl start ai-trader.service
