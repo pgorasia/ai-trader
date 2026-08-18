@@ -61,12 +61,15 @@ class DaemonSupervisor:
     """Calendar-driven, interruptibly sleeping wrapper around Shadow sessions."""
     def __init__(self, orchestrator: Any, *, stop_event: threading.Event | None = None,
                  heartbeat: Heartbeat | None = None, preflight_lead_minutes: int = 10,
+                 preflight_tolerance_minutes: int | None = None,
                  heartbeat_seconds: int = 60, local_maintenance: LocalMaintenanceController | None = None) -> None:
         self.orchestrator = orchestrator
         self.calendar = orchestrator.calendar
         self.stop_event = stop_event or threading.Event()
         self.heartbeat = heartbeat or Heartbeat(orchestrator.root / "state" / "heartbeat.json", orchestrator.root)
         self.preflight_lead_minutes = preflight_lead_minutes
+        configured = orchestrator.config.get("schedule", {}).get("preflight_tolerance_minutes", 5) if hasattr(orchestrator, "config") else 5
+        self.preflight_tolerance_minutes = int(configured if preflight_tolerance_minutes is None else preflight_tolerance_minutes)
         self.heartbeat_seconds = heartbeat_seconds
         self.local_maintenance = local_maintenance or LocalMaintenanceController(
             orchestrator.root, python="/home/ubuntu/.venvs/ai-trader/bin/python"
@@ -96,6 +99,7 @@ class DaemonSupervisor:
         _audit("DAEMON_STARTED", mode="SHADOW")
         while not self.stop_event.is_set():
             now = self.orchestrator._trusted_now()
+            self._recover_expired_session(now)
             session = self._session_to_run(now)
             preflight_at = session.market_open - timedelta(minutes=self.preflight_lead_minutes)
             if now < preflight_at and not self.wait_until(preflight_at, "WAITING_FOR_PREFLIGHT"):
@@ -111,6 +115,17 @@ class DaemonSupervisor:
                 continue
             try:
                 if not any(item["status"] == "COMPLETED" for item in terminal):
+                    current = self.orchestrator._trusted_now()
+                    if not self._preflight_eligible(session, current):
+                        _audit("OPERATION_NOT_ELIGIBLE", operation="PREFLIGHT", reason="WINDOW_EXPIRED",
+                               session=session.session_date)
+                        next_session = self.calendar.next_session(session.eod_time + timedelta(seconds=1))
+                        next_action = self._preflight_at(next_session)
+                        _audit("WAITING_FOR_NEXT_SESSION", session=next_session.session_date)
+                        _audit("NEXT_ACTION", scheduled_for=next_action.isoformat())
+                        if not self.wait_until(next_action, "WAITING_FOR_NEXT_SESSION"):
+                            break
+                        continue
                     _audit("PREFLIGHT_START", session=session.session_date)
                     self.heartbeat.update("PREFLIGHT_RUNNING")
                     started = [item for item in state.get("preflight_operations", [])
@@ -167,26 +182,58 @@ class DaemonSupervisor:
                                   last_local_health_check=datetime.now(timezone.utc).isoformat())
 
     def _session_to_run(self, now: datetime):
-        """Recover a passed-preflight session whose EOD was missed by a reboot."""
-        today = self.calendar.session_for(now.astimezone(ET).date())
-        if today is not None and now >= today.eod_time:
-            path = self.orchestrator.store.path_for(today.session_date)
-            if path.exists():
-                state = self.orchestrator.store.load(today.session_date, create=False)
-                passed = any(item.get("status") == "COMPLETED"
-                             for item in state.get("preflight_operations", []))
-                failed = any(item.get("status") == "FAILED"
-                             for item in state.get("preflight_operations", []))
-                if passed and not failed and not state.get("eod_completed"):
-                    from .operations import eligible, operation
-                    record = operation(state, f"eod:{today.session_date}")
-                    circuit_open = state.get("ai_circuit", {}).get("status") == "OPEN"
-                    # A past timestamp is insufficient: persisted state must
-                    # explicitly permit this operation now, or local EOD must
-                    # be needed because the circuit is open.
-                    if circuit_open or record is None or record.get("state") == "RETRY_WAIT" or eligible(record, now, False):
-                        return today
+        """Select only a current/future session; expired sessions are never executable."""
         return self.calendar.next_session(now)
+
+    def _preflight_at(self, session: Any) -> datetime:
+        return session.market_open - timedelta(minutes=self.preflight_lead_minutes)
+
+    def _preflight_eligible(self, session: Any, now: datetime) -> bool:
+        start = self._preflight_at(session)
+        return start <= now.astimezone(ET) <= start + timedelta(minutes=self.preflight_tolerance_minutes)
+
+    @staticmethod
+    def _eod_terminal(state: dict[str, Any]) -> bool:
+        if state.get("eod_completed") or state.get("legacy_recovery_state") == "LEGACY_RECOVERY_FINALIZED":
+            return True
+        return any(item.get("operation_type") == "EOD" and item.get("state") == "FAILED_TERMINAL"
+                   for item in state.get("ai_operations", []))
+
+    def _recover_expired_session(self, now: datetime) -> bool:
+        """State-only startup recovery. This path must never invoke a runner or broker."""
+        session = self.calendar.session_for(now.astimezone(ET).date())
+        if session is None or now.astimezone(ET) < session.market_close:
+            return False
+        path = self.orchestrator.store.path_for(session.session_date)
+        if not path.exists():
+            return False
+        state = self.orchestrator.store.load(session.session_date, create=False)
+        if self._eod_terminal(state):
+            return False
+        _audit("POST_CLOSE_RECOVERY", session=session.session_date)
+        circuit_open = state.get("ai_circuit", {}).get("status") == "OPEN"
+        has_operation_structure = bool(state.get("ai_operations"))
+        if circuit_open:
+            status = "SKIPPED_CIRCUIT_OPEN"
+        elif not has_operation_structure:
+            _audit("LEGACY_SESSION_DETECTED", session=session.session_date)
+            status = "LEGACY_RECOVERY_FINALIZED"
+            state["legacy_recovery_state"] = status
+            _audit("LEGACY_SESSION_FINALIZED", session=session.session_date, reason="MISSING_OPERATION_STATE")
+        else:
+            status = "POST_CLOSE_RECOVERY_FINALIZED"
+            state["post_close_recovery_state"] = status
+        state["eod_completed"] = True
+        state["session_terminal"] = True
+        state["eod_review"] = {"session_date": session.session_date, "status": status,
+                               "metrics_retained": True, "recovery_reason": "STARTED_AFTER_MARKET_CLOSE"}
+        self.orchestrator.store.save(state)
+        next_session = self.calendar.next_session(session.eod_time + timedelta(seconds=1))
+        next_action = self._preflight_at(next_session)
+        _audit("WAITING_FOR_NEXT_SESSION", session=next_session.session_date)
+        _audit("NEXT_ACTION", scheduled_for=next_action.isoformat())
+        self.heartbeat.update("WAITING_FOR_NEXT_SESSION", next_action)
+        return True
 
 
 def health_check(root: Path, *, now: datetime | None = None,

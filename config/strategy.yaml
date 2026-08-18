@@ -24,6 +24,7 @@ codex:
   sandbox: read-only
 
 schedule:
+  preflight_tolerance_minutes: 5
   no_entry_before: "09:40"
   morning_end: "11:00"
   midday_end: "14:00"

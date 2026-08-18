@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -51,6 +52,7 @@ WRITE_CAPABILITY_PREFIXES = (
     "place_", "review_", "cancel_", "create_order", "modify_order",
     "exercise_", "replace_order", "submit_order",
 )
+LOGGER = logging.getLogger("ai_trader")
 
 
 def _stamp(value: datetime) -> str:
@@ -130,6 +132,23 @@ class AIMaintenanceGate:
     def queued(self) -> dict[str, Any] | None:
         return self.load().get("queue")
 
+    def reconcile_source_commit(self, current_commit: str) -> bool:
+        """Locally retire queue entries created against any other code state."""
+        data = self.load()
+        queue = data.get("queue")
+        if not queue:
+            return False
+        if queue.get("source_git_commit") == current_commit:
+            return False
+        fingerprint = queue.get("failure_fingerprint")
+        record = data["failures"].get(fingerprint)
+        if record:
+            record["resolution_status"] = "STALE_NEEDS_REEVALUATION"
+        data["queue"] = None
+        self.save(data)
+        LOGGER.info("AI_TRADER event=MAINTENANCE_QUEUE_STALE reason=SOURCE_COMMIT_MISMATCH")
+        return True
+
     def resolve(self, fingerprint: str, status: str) -> None:
         data = self.load()
         record = data["failures"].get(fingerprint)
@@ -148,6 +167,7 @@ class LocalMaintenanceController:
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.path = root / "state/local_maintenance.json"
         self.gate = AIMaintenanceGate(root / "state/ai_maintenance.json")
+        self.gate.reconcile_source_commit(git_head(root))
         self.calendar = EquityMarketCalendar("XNYS")
 
     def run_due(self, *, force_daily: bool = False) -> dict[str, Any]:
@@ -457,13 +477,11 @@ def invoke_maintenance_codex(worktree: Path, queue: dict[str, Any], *,
 
 def process_ai_queue(active: Path = ACTIVE_ROOT, worktree: Path = WORKTREE) -> int:
     gate = AIMaintenanceGate(active / "state/ai_maintenance.json")
+    gate.reconcile_source_commit(git_head(active))
     queue = gate.queued()
     if queue is None:
         return 0
     current_commit = git_head(active)
-    if not queue.get("source_git_commit") or queue.get("source_git_commit") != current_commit:
-        gate.resolve(queue["failure_fingerprint"], "STALE_NEEDS_REEVALUATION")
-        return 0
     now = datetime.now(ET)
     if not shadow_mode(active) or trading_active_or_imminent(now, EquityMarketCalendar("XNYS")):
         return 30

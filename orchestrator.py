@@ -569,6 +569,7 @@ class ShadowOrchestrator:
             if operation_id not in state["operation_ids"]:
                 state["schedule_events"].append({"operation_id": operation_id, "status": "SKIPPED_STALE", "scheduled_for": slot.isoformat(), "observed_at": current.isoformat()})
                 state["operation_ids"].append(operation_id)
+                audit("STALE_SLOT_MARKED", scheduled_for=slot.isoformat())
         if stale_initial:
             self.store.save(state)
         scan_slots = {slot for slot in remaining_slots if not self.scheduler.is_stale(slot, current)}
@@ -590,6 +591,7 @@ class ShadowOrchestrator:
                         if operation_id not in state["operation_ids"]:
                             state["schedule_events"].append({"operation_id": operation_id, "status": "SKIPPED_STALE", "scheduled_for": event_time.isoformat(), "observed_at": actual.isoformat()})
                             state["operation_ids"].append(operation_id)
+                            audit("STALE_SLOT_MARKED", scheduled_for=event_time.isoformat())
                             self.store.save(state)
                     else:
                         self.run_luna_cycle(state, session, event_time)

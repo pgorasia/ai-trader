@@ -81,7 +81,7 @@ class LinuxAutomationTests(unittest.TestCase):
             problems = health_check(self._healthy_root(directory, now - timedelta(minutes=10)), now=now)
             self.assertIn("heartbeat is stale", problems)
 
-    def test_restart_after_eod_recovers_incomplete_session(self):
+    def test_restart_after_eod_does_not_select_expired_session(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = StateStore(root / "state")
@@ -99,7 +99,7 @@ class LinuxAutomationTests(unittest.TestCase):
             })()
             supervisor = DaemonSupervisor(orchestrator)
             recovered = supervisor._session_to_run(datetime.fromisoformat("2026-08-14T17:00:00-04:00"))
-            self.assertEqual(recovered.session_date, "2026-08-14")
+            self.assertEqual(recovered.session_date, "2026-08-17")
 
     def test_maintenance_refuses_market_activity_and_imminence(self):
         calendar = EquityMarketCalendar("XNYS")
