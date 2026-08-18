@@ -94,6 +94,15 @@ class OrchestratorSemanticTests(unittest.TestCase):
         finalists = self.fixture("luna_candidate.json")["finalists"]
         self.core._validate_senior(decision, finalists, initial_state("2026-08-14"), self.session, 3)
 
+    def test_senior_sizing_ignores_external_positions_orders_and_brokerage_capital(self):
+        decision = self.fixture("senior_plan.json")
+        finalists = self.fixture("luna_candidate.json")["finalists"]
+        state = initial_state("2026-08-14")
+        state["baseline_positions"] = [{"attribution": "BASELINE_EXTERNAL", "symbol": "TEST", "quantity": 1000000.0}]
+        state["baseline_external_orders"] = [{"attribution": "BASELINE_EXTERNAL_ORDER", "symbol": "TEST", "side": "buy", "state": "open"}]
+        state["brokerage_snapshot"] = {"account_equity": 1.0, "buying_power": 0.0, "reserved_buying_power": 1000000.0}
+        self.core._validate_senior(decision, finalists, state, self.session, 3)
+
     def test_senior_required_web_failure_fails_closed(self):
         decision = self.fixture("senior_no_trade.json")
         finalists = self.fixture("luna_candidate.json")["finalists"]

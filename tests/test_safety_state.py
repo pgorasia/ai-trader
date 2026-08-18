@@ -11,7 +11,7 @@ from trader.codex_runner import CodexRunner
 from trader.codex_events import parse_codex_jsonl
 from trader.models import CodexRunError, CodexTimeoutError, PreflightError, SchemaValidationError, StateCorruptionError
 from trader.safety import enforce_preflight_result, load_config, offline_preflight, validate_json
-from trader.state import StateStore, initial_state
+from trader.state import StateStore, initial_state, validate_state_shape
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,17 +74,15 @@ class SafetySchemaStateTests(unittest.TestCase):
         with self.assertRaises(PreflightError):
             enforce_preflight_result(result)
 
-    def test_preflight_unexpected_account_position(self):
+    def test_preflight_baseline_account_position_is_allowed(self):
         result = self.good_preflight()
-        result["positions_job"]["unexpected_position_count"] = 1
-        with self.assertRaisesRegex(PreflightError, "position"):
-            enforce_preflight_result(result)
+        result["positions_job"].update({"baseline_position_count": 1, "baseline_positions_present": True})
+        enforce_preflight_result(result)
 
-    def test_preflight_unexpected_order(self):
+    def test_preflight_external_order_is_informational(self):
         result = self.good_preflight()
-        result["orders_job"]["unexpected_order_count"] = 1
-        with self.assertRaisesRegex(PreflightError, "order"):
-            enforce_preflight_result(result)
+        result["orders_job"].update({"baseline_external_order_count": 1, "baseline_external_orders_present": True})
+        enforce_preflight_result(result)
 
     def test_preflight_forbidden_tool(self):
         result = self.good_preflight()
@@ -102,6 +100,17 @@ class SafetySchemaStateTests(unittest.TestCase):
             path.write_text("{partial", encoding="utf-8")
             with self.assertRaises(StateCorruptionError):
                 store.load("2026-08-14")
+
+    def test_same_symbol_baseline_and_shadow_records_have_independent_attribution(self):
+        state = initial_state("2026-08-14")
+        state["baseline_positions"] = [{"attribution": "BASELINE_EXTERNAL", "symbol": "MU", "quantity": 50.0}]
+        state["shadow_positions"] = [{"attribution": "SHADOW_AI", "plan_id": "p1", "symbol": "MU"}]
+        state["completed_shadow_trades"] = [{"attribution": "SHADOW_AI", "plan_id": "p1", "symbol": "MU", "pnl": 1.25, "entry_timestamp": "2026-08-14T10:00:00-04:00", "exit_timestamp": "2026-08-14T10:30:00-04:00"}]
+        validate_state_shape(state)
+        self.assertEqual(state["baseline_positions"], [{"attribution": "BASELINE_EXTERNAL", "symbol": "MU", "quantity": 50.0}])
+        self.assertNotIn(state["baseline_positions"][0], state["shadow_positions"])
+        self.assertNotIn(state["baseline_positions"][0], state["completed_shadow_trades"])
+        self.assertEqual(state["completed_shadow_trades"][0]["pnl"], 1.25)
 
     def test_codex_timeout_is_not_retried(self):
         runner = CodexRunner(ROOT, self.config)
@@ -143,8 +152,8 @@ class SafetySchemaStateTests(unittest.TestCase):
             "boundary_status": "PASS",
             "identity_job": {"status": "PASS"},
             "portfolio_job": {"status": "PASS"},
-            "positions_job": {"status": "PASS", "unexpected_position_count": 0},
-            "orders_job": {"status": "PASS", "unexpected_order_count": 0},
+            "positions_job": {"status": "PASS", "baseline_position_count": 0, "baseline_positions_present": False},
+            "orders_job": {"status": "PASS", "baseline_external_order_count": 0, "baseline_external_orders_present": False},
         }
 
 

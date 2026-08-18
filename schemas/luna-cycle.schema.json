@@ -196,8 +196,10 @@
         "reconciled",
         "account_equity",
         "buying_power",
-        "unexpected_positions",
-        "unexpected_orders"
+        "baseline_position_count",
+        "baseline_external_order_count",
+        "baseline_external_orders_present",
+        "baseline_external_orders"
       ],
       "properties": {
         "agentic_account_count": {
@@ -218,11 +220,27 @@
             "null"
           ]
         },
-        "unexpected_positions": {
+        "baseline_position_count": {
           "type": "integer"
         },
-        "unexpected_orders": {
+        "baseline_external_order_count": {
           "type": "integer"
+        },
+        "baseline_external_orders_present": {
+          "type": "boolean"
+        },
+        "baseline_external_orders": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["symbol", "state", "side"],
+            "properties": {
+              "symbol": {"type": "string"},
+              "state": {"type": "string"},
+              "side": {"type": "string"}
+            }
+          }
         }
       }
     },

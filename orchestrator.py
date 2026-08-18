@@ -205,8 +205,14 @@ class ShadowOrchestrator:
                 summary = {"status": "FAIL", "observed_calls": dict(child.tool_calls), "mcp_teardown_warning_codes": list(diagnostics.get("diagnostic_codes", []))}
                 if stage == "identity": summary.update({"agentic_account_count": child.data["agentic_account_count"], "unique_agentic_account": child.data["unique_agentic_account"]})
                 elif stage == "portfolio": summary.update({"account_equity": child.data["account_equity"], "buying_power": child.data["buying_power"], "portfolio_status": child.data["portfolio_status"]})
-                elif stage == "positions": summary.update({"position_count": child.data["position_count"], "unexpected_position_count": child.data["unexpected_position_count"], "unexpected_positions": child.data["unexpected_positions"]})
-                else: summary.update({"relevant_order_count": child.data["relevant_order_count"], "open_pending_count": child.data["open_pending_count"], "unexpected_order_count": child.data["unexpected_order_count"], "unexpected_orders": child.data["unexpected_orders"]})
+                elif stage == "positions":
+                    baseline_positions = [{"attribution": "BASELINE_EXTERNAL", "symbol": item["symbol"], "quantity": item["quantity"]} for item in child.data["baseline_positions"]]
+                    working["baseline_positions"] = baseline_positions
+                    summary.update({"baseline_position_count": child.data["baseline_position_count"], "baseline_positions_present": child.data["baseline_positions_present"], "baseline_positions": baseline_positions})
+                else:
+                    baseline_orders = [{"attribution": "BASELINE_EXTERNAL_ORDER", "symbol": item["symbol"], "side": item["side"], "state": item["state"]} for item in child.data["baseline_external_orders"]]
+                    working["baseline_external_orders"] = baseline_orders
+                    summary.update({"relevant_order_count": child.data["relevant_order_count"], "open_pending_count": child.data["open_pending_count"], "baseline_external_order_count": child.data["baseline_external_order_count"], "baseline_external_orders_present": child.data["baseline_external_orders_present"], "baseline_external_orders": baseline_orders})
                 result[report_key] = summary
                 if child.web_searches: raise PreflightError(f"{stage} preflight stage unexpectedly used web search")
                 enforce_preflight_stage(stage, child.data)
@@ -298,6 +304,10 @@ class ShadowOrchestrator:
         cycle["cli_usage"] = result.usage
         cycle["cli_tool_calls"] = result.tool_calls
         cycle["cli_diagnostics"] = result.diagnostics
+        state["baseline_external_orders"] = [
+            {"attribution": "BASELINE_EXTERNAL_ORDER", "symbol": item["symbol"], "side": item["side"], "state": item["state"]}
+            for item in cycle["account_status"]["baseline_external_orders"]
+        ]
         state["cycles"].append(cycle)
         operation_id = f"luna:{cycle_id}"
         if operation_id in state["operation_ids"]:
@@ -379,6 +389,7 @@ class ShadowOrchestrator:
                 original_plan["trailing_lookback_bars"] = int(self.config["experiment"]["trailing_lookback_completed_bars"])
                 frozen = {
                     "plan_id": plan_id, "frozen_at": decision["decision_timestamp"],
+                    "attribution": "SHADOW_AI",
                     "research_role": role, "research_rank": rank, "parent_cycle_id": cycle["cycle_id"],
                     "original_plan": original_plan, "outcome": self.monitor.initial_outcome(),
                     "trailing_outcome": self.monitor.initial_trailing_outcome(decision["stop_price"]),
@@ -427,7 +438,7 @@ class ShadowOrchestrator:
             updated_by_id[plan["plan_id"]] = self.monitor.evaluate_trailing(updated, result.data["symbol_bars"][symbol], now)
         state["shadow_plans"] = [updated_by_id.get(item["plan_id"], item) for item in state["shadow_plans"]]
         state["shadow_positions"] = [
-            {"plan_id": item["plan_id"], "symbol": item["original_plan"]["symbol"], "research_role": item.get("research_role", "PRIMARY"), "variant": variant, "entry_price": outcome["entry_price"], "entry_timestamp": outcome["entry_timestamp"]}
+            {"attribution": "SHADOW_AI", "plan_id": item["plan_id"], "symbol": item["original_plan"]["symbol"], "research_role": item.get("research_role", "PRIMARY"), "variant": variant, "entry_price": outcome["entry_price"], "entry_timestamp": outcome["entry_timestamp"]}
             for item in state["shadow_plans"] for variant, outcome in (("FIXED_TARGET", item["outcome"]), ("TRAILING_STOP", item.get("trailing_outcome", {}))) if outcome.get("status") == "OPEN"
         ]
         self._record_completed_trades(state)
@@ -659,7 +670,7 @@ class ShadowOrchestrator:
         forbidden = {normalize_tool_name(name) for name in security["forbidden_tools_available"]} & FORBIDDEN_ROBINHOOD_TOOLS
         if not security["robinhood_mcp_available"] or not security["boundary_ok"] or forbidden:
             raise PreflightError("Luna security boundary failed")
-        if account["agentic_account_count"] != 1 or not account["reconciled"] or account["unexpected_positions"] or account["unexpected_orders"]:
+        if account["agentic_account_count"] != 1 or not account["reconciled"]:
             raise PreflightError("Luna account reconciliation failed")
         if expected_cycle_id is not None and cycle["cycle_id"] != expected_cycle_id:
             raise SchemaValidationError("Luna returned an unexpected cycle_id")
@@ -854,7 +865,7 @@ class ShadowOrchestrator:
             if record.get("research_role", "PRIMARY") == "PRIMARY" and record["plan_id"] not in existing and outcome["status"] in {"TARGET1", "STOPPED", "FLAT_TIME"}:
                 entry_time = aware(outcome["entry_timestamp"]).astimezone(ET)
                 state["completed_shadow_trades"].append({
-                    "plan_id": record["plan_id"], "symbol": plan["symbol"], "setup_type": plan["setup_type"], "market_regime": plan["market_regime"],
+                    "attribution": "SHADOW_AI", "plan_id": record["plan_id"], "symbol": plan["symbol"], "setup_type": plan["setup_type"], "market_regime": plan["market_regime"],
                     "catalyst_classification": plan["catalyst_classification"], "time_of_day": entry_time.strftime("%H:%M"),
                     "hypothetical_notional": plan["hypothetical_notional"], "planned_dollar_risk": plan["planned_dollar_risk"],
                     "entry_timestamp": outcome["entry_timestamp"], "entry_price": outcome["entry_price"], "exit_timestamp": outcome["exit_timestamp"],

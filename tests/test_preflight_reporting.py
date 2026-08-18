@@ -24,8 +24,8 @@ def staged_payload(name):
     common = {"passed": True, "account_classifications": [account], "errors": []}
     if name == "preflight.md": return common
     if name == "preflight-portfolio.md": return {**common, "account_reconciled": True, "account_equity": 100.0, "buying_power": 100.0, "portfolio_status": "active"}
-    if name == "preflight-positions.md": return {**common, "account_reconciled": True, "position_count": 0, "unexpected_position_count": 0, "unexpected_positions": []}
-    return {**common, "account_reconciled": True, "relevant_order_count": 0, "open_pending_count": 0, "unexpected_order_count": 0, "unexpected_orders": []}
+    if name == "preflight-positions.md": return {**common, "account_reconciled": True, "baseline_position_count": 0, "baseline_positions_present": False, "baseline_positions": []}
+    return {**common, "account_reconciled": True, "relevant_order_count": 0, "open_pending_count": 0, "baseline_external_order_count": 0, "baseline_external_orders_present": False, "baseline_external_orders": []}
 
 
 class Runner:

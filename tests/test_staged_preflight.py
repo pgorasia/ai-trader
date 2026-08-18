@@ -29,8 +29,8 @@ def payload(stage: str) -> dict:
     common = {"passed": True, "account_classifications": [valid_account()], "errors": []}
     if stage == "identity": return common
     if stage == "portfolio": return {**common, "account_reconciled": True, "account_equity": 100.0, "buying_power": 100.0, "portfolio_status": "active"}
-    if stage == "positions": return {**common, "account_reconciled": True, "position_count": 0, "unexpected_position_count": 0, "unexpected_positions": []}
-    return {**common, "account_reconciled": True, "relevant_order_count": 0, "open_pending_count": 0, "unexpected_order_count": 0, "unexpected_orders": []}
+    if stage == "positions": return {**common, "account_reconciled": True, "baseline_position_count": 0, "baseline_positions_present": False, "baseline_positions": []}
+    return {**common, "account_reconciled": True, "relevant_order_count": 0, "open_pending_count": 0, "baseline_external_order_count": 0, "baseline_external_orders_present": False, "baseline_external_orders": []}
 
 
 def valid_account(**changes) -> dict:
@@ -171,17 +171,53 @@ class StagedPreflightTests(unittest.TestCase):
         with self.assertRaises(PreflightError): self.execute(runner)
         self.assertEqual(len(runner.calls), 2)
 
-    def test_unexpected_position_stops_before_orders(self):
-        mutation = {"position_count": 1, "unexpected_position_count": 1, "unexpected_positions": [{"symbol": "TEST", "quantity": 1.0}]}
-        runner = StagedRunner(mutations={"positions": mutation})
-        with self.assertRaises(PreflightError): self.execute(runner)
-        self.assertEqual(len(runner.calls), 3)
+    def test_existing_positions_pass_and_persist_as_external_baseline(self):
+        for positions in ([{"symbol": "MU", "quantity": 2.0}], [{"symbol": "MU", "quantity": 2.0}, {"symbol": "SPY", "quantity": 0.5}]):
+            with self.subTest(count=len(positions)):
+                mutation = {"baseline_position_count": len(positions), "baseline_positions_present": True, "baseline_positions": positions}
+                runner = StagedRunner(mutations={"positions": mutation})
+                _core, state, result = self.execute(runner)
+                self.assertEqual(len(runner.calls), 4)
+                self.assertEqual(result["positions_job"]["baseline_position_count"], len(positions))
+                self.assertTrue(result["positions_job"]["baseline_positions_present"])
+                self.assertEqual(state["baseline_positions"], [{"attribution": "BASELINE_EXTERNAL", **item} for item in positions])
+                self.assertEqual(state["shadow_positions"], [])
+                self.assertEqual(state["completed_shadow_trades"], [])
 
-    def test_unexpected_open_order_fails_overall(self):
-        mutation = {"relevant_order_count": 1, "open_pending_count": 1, "unexpected_order_count": 1, "unexpected_orders": [{"symbol": "TEST", "state": "open", "side": "buy"}]}
-        runner = StagedRunner(mutations={"orders": mutation})
-        with self.assertRaises(PreflightError): self.execute(runner)
-        self.assertEqual(len(runner.calls), 4)
+    def test_external_open_orders_pass_and_persist_separately(self):
+        for orders in ([{"symbol": "TEST", "state": "open", "side": "buy"}], [{"symbol": "MU", "state": "queued", "side": "buy"}, {"symbol": "SPY", "state": "confirmed", "side": "sell"}]):
+            with self.subTest(count=len(orders)):
+                mutation = {"relevant_order_count": len(orders), "open_pending_count": len(orders), "baseline_external_order_count": len(orders), "baseline_external_orders_present": True, "baseline_external_orders": orders}
+                _core, state, result = self.execute(StagedRunner(mutations={"orders": mutation}))
+                expected = [{"attribution": "BASELINE_EXTERNAL_ORDER", **item} for item in orders]
+                self.assertEqual(result["orders_job"]["baseline_external_order_count"], len(orders))
+                self.assertTrue(result["orders_job"]["baseline_external_orders_present"])
+                self.assertEqual(state["baseline_external_orders"], expected)
+                self.assertEqual(state["shadow_positions"], [])
+                self.assertEqual(state["completed_shadow_trades"], [])
+
+    def test_position_and_external_order_pass_together(self):
+        positions = {"baseline_position_count": 1, "baseline_positions_present": True, "baseline_positions": [{"symbol": "MU", "quantity": 50.0}]}
+        orders = {"relevant_order_count": 1, "open_pending_count": 1, "baseline_external_order_count": 1, "baseline_external_orders_present": True, "baseline_external_orders": [{"symbol": "MU", "state": "open", "side": "buy"}]}
+        _core, state, result = self.execute(StagedRunner(mutations={"positions": positions, "orders": orders}))
+        self.assertEqual(result["positions_job"]["status"], "PASS")
+        self.assertEqual(result["orders_job"]["status"], "PASS")
+        self.assertEqual(state["baseline_positions"][0]["attribution"], "BASELINE_EXTERNAL")
+        self.assertEqual(state["baseline_external_orders"][0]["attribution"], "BASELINE_EXTERNAL_ORDER")
+
+    def test_external_fill_reconciles_only_as_external_account_activity(self):
+        directory = tempfile.TemporaryDirectory(); self.addCleanup(directory.cleanup)
+        open_order = {"relevant_order_count": 1, "open_pending_count": 1, "baseline_external_order_count": 1, "baseline_external_orders_present": True, "baseline_external_orders": [{"symbol": "MU", "state": "open", "side": "buy"}]}
+        runner = StagedRunner(mutations={"orders": open_order})
+        core = self.core(directory.name, runner); state = initial_state("2026-08-14"); core.store.save(state)
+        core.preflight(state, datetime.fromisoformat("2026-08-14T09:35:00-04:00"))
+        state["shadow_plans"] = []; state["shadow_positions"] = []; state["completed_shadow_trades"] = []
+        runner.mutations = {"positions": {"baseline_position_count": 1, "baseline_positions_present": True, "baseline_positions": [{"symbol": "MU", "quantity": 5.0}]}}
+        core.preflight(state, datetime.fromisoformat("2026-08-14T09:36:00-04:00"))
+        self.assertEqual(state["baseline_external_orders"], [])
+        self.assertEqual(state["baseline_positions"], [{"attribution": "BASELINE_EXTERNAL", "symbol": "MU", "quantity": 5.0}])
+        self.assertEqual(state["shadow_positions"], [])
+        self.assertEqual(state["completed_shadow_trades"], [])
 
 
 class AgenticIdentitySemanticsTests(unittest.TestCase):

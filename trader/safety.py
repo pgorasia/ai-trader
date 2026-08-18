@@ -252,13 +252,15 @@ def _validate_removed_schema_invariants(data: dict[str, Any], schema_name: str) 
             for key in ("account_equity", "buying_power"):
                 if data[key] is not None: _number(data[key], key, minimum=0)
         elif schema_name == "preflight-positions.schema.json":
-            for key in ("position_count", "unexpected_position_count"): _number(data[key], key, minimum=0)
-            for index, item in enumerate(data["unexpected_positions"]): _symbol(item["symbol"], f"unexpected_positions[{index}].symbol"); _number(item["quantity"], "quantity", minimum=0)
-            if data["unexpected_position_count"] != len(data["unexpected_positions"]): raise SchemaValidationError("Unexpected position count does not match details")
+            _number(data["baseline_position_count"], "baseline_position_count", minimum=0)
+            for index, item in enumerate(data["baseline_positions"]): _symbol(item["symbol"], f"baseline_positions[{index}].symbol"); _number(item["quantity"], "quantity", exclusive_minimum=0)
+            if data["baseline_position_count"] != len(data["baseline_positions"]): raise SchemaValidationError("Baseline position count does not match details")
+            if data["baseline_positions_present"] != bool(data["baseline_positions"]): raise SchemaValidationError("Baseline position presence does not match details")
         elif schema_name == "preflight-orders.schema.json":
-            for key in ("relevant_order_count", "open_pending_count", "unexpected_order_count"): _number(data[key], key, minimum=0)
-            for index, item in enumerate(data["unexpected_orders"]): _symbol(item["symbol"], f"unexpected_orders[{index}].symbol")
-            if data["unexpected_order_count"] != len(data["unexpected_orders"]): raise SchemaValidationError("Unexpected order count does not match details")
+            for key in ("relevant_order_count", "open_pending_count", "baseline_external_order_count"): _number(data[key], key, minimum=0)
+            for index, item in enumerate(data["baseline_external_orders"]): _symbol(item["symbol"], f"baseline_external_orders[{index}].symbol")
+            if data["baseline_external_order_count"] != len(data["baseline_external_orders"]): raise SchemaValidationError("Baseline external order count does not match details")
+            if data["baseline_external_orders_present"] != bool(data["baseline_external_orders"]): raise SchemaValidationError("Baseline external order presence does not match details")
     elif schema_name == "luna-cycle.schema.json":
         _nonempty(data["cycle_id"], "cycle_id"); _date(data["session_date"], "session_date"); _aware_timestamp(data["timestamp"], "timestamp")
         _nonempty(data["scanner"]["name"], "scanner.name"); _nonempty(data["scanner"]["id"], "scanner.id")
@@ -281,8 +283,12 @@ def _validate_removed_schema_invariants(data: dict[str, Any], schema_name: str) 
             if len(bars) > 8: raise SchemaValidationError("completed_15m_structure exceeds eight bars")
             for bar_index, bar in enumerate(bars): _bar(bar, f"completed_15m_structure[{bar_index}]")
         _unique(data["security_status"]["forbidden_tools_available"], "forbidden_tools_available", normalize=normalize_tool_name)
-        for key in ("agentic_account_count", "unexpected_positions", "unexpected_orders"):
+        for key in ("agentic_account_count", "baseline_position_count", "baseline_external_order_count"):
             _number(data["account_status"][key], key, minimum=0)
+        external_orders = data["account_status"]["baseline_external_orders"]
+        for index, item in enumerate(external_orders): _symbol(item["symbol"], f"account_status.baseline_external_orders[{index}].symbol")
+        if data["account_status"]["baseline_external_order_count"] != len(external_orders): raise SchemaValidationError("Stage-B baseline external order count does not match details")
+        if data["account_status"]["baseline_external_orders_present"] != bool(external_orders): raise SchemaValidationError("Stage-B baseline external order presence does not match details")
         for key in ("account_equity", "buying_power"):
             if data["account_status"][key] is not None: _number(data["account_status"][key], key, minimum=0)
         for key, value in data["tool_call_count"].items(): _number(value, f"tool_call_count.{key}", minimum=0)
@@ -382,10 +388,6 @@ def enforce_preflight_stage(stage: str, result: dict[str, Any]) -> None:
         reasons.append(f"{stage} stage did not pass")
     if stage != "identity" and not result["account_reconciled"]:
         reasons.append("Agentic account reconciliation failed")
-    if stage == "positions" and result["unexpected_position_count"] != 0:
-        reasons.append("Unexpected real equity position exists")
-    if stage == "orders" and result["unexpected_order_count"] != 0:
-        reasons.append("Unexpected real equity order exists")
     if result["errors"]:
         reasons.append(f"{stage} stage returned errors")
     if reasons:
@@ -397,8 +399,6 @@ def enforce_preflight_result(result: dict[str, Any]) -> None:
     if result.get("boundary_status") != "PASS": reasons.append("Deterministic SHADOW boundary failed")
     for stage in ("identity_job", "portfolio_job", "positions_job", "orders_job"):
         if result.get(stage, {}).get("status") != "PASS": reasons.append(f"{stage} failed")
-    if result.get("positions_job", {}).get("unexpected_position_count") != 0: reasons.append("Unexpected real equity position exists")
-    if result.get("orders_job", {}).get("unexpected_order_count") != 0: reasons.append("Unexpected real equity order exists")
     if reasons: raise PreflightError("; ".join(reasons))
 
 

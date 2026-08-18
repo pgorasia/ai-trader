@@ -38,6 +38,43 @@ class ShadowMonitorTests(unittest.TestCase):
         self.assertTrue(result["outcome"]["stop_hit"])
         self.assertAlmostEqual(result["outcome"]["pnl"], -1.0)
 
+    def test_same_symbol_baseline_quantity_cannot_affect_shadow_stop_or_pnl(self):
+        bars = [
+            bar("2026-08-14T10:05:00-04:00", 9.8, 10.2, 9.7, 10.1),
+            bar("2026-08-14T10:10:00-04:00", 10.1, 10.4, 9.4, 9.6),
+        ]
+        expected = self.monitor.evaluate(self.record, bars, datetime.fromisoformat("2026-08-14T10:15:00-04:00"))
+        state = {
+            "baseline_positions": [{"attribution": "BASELINE_EXTERNAL", "symbol": "TEST", "quantity": 1000000.0}],
+            "shadow_plans": [{**deepcopy(self.record), "attribution": "SHADOW_AI"}],
+        }
+        actual = self.monitor.evaluate(state["shadow_plans"][0], bars, datetime.fromisoformat("2026-08-14T10:15:00-04:00"))
+        self.assertEqual(actual["outcome"], expected["outcome"])
+        self.assertEqual(actual["outcome"]["status"], "STOPPED")
+        self.assertAlmostEqual(actual["outcome"]["pnl"], -1.0)
+        self.assertEqual(state["baseline_positions"][0]["quantity"], 1000000.0)
+
+    def test_same_symbol_external_order_cannot_become_fill_or_affect_shadow_metrics(self):
+        bars = [
+            bar("2026-08-14T10:05:00-04:00", 9.8, 10.2, 9.7, 10.1),
+            bar("2026-08-14T10:10:00-04:00", 10.1, 10.4, 9.4, 9.6),
+        ]
+        expected = self.monitor.evaluate(self.record, bars, datetime.fromisoformat("2026-08-14T10:15:00-04:00"))
+        state = {
+            "baseline_external_orders": [{"attribution": "BASELINE_EXTERNAL_ORDER", "symbol": "TEST", "side": "buy", "state": "filled"}],
+            "baseline_positions": [{"attribution": "BASELINE_EXTERNAL", "symbol": "TEST", "quantity": 999999.0}],
+            "shadow_plans": [{**deepcopy(self.record), "attribution": "SHADOW_AI"}],
+            "shadow_positions": [],
+            "completed_shadow_trades": [],
+        }
+        actual = self.monitor.evaluate(state["shadow_plans"][0], bars, datetime.fromisoformat("2026-08-14T10:15:00-04:00"))
+        self.assertEqual(actual["outcome"], expected["outcome"])
+        self.assertEqual(actual["outcome"]["pnl"], -1.0)
+        self.assertEqual(actual["outcome"]["mfe"], expected["outcome"]["mfe"])
+        self.assertEqual(actual["outcome"]["mae"], expected["outcome"]["mae"])
+        self.assertEqual(state["shadow_positions"], [])
+        self.assertEqual(state["completed_shadow_trades"], [])
+
     def test_target_before_stop(self):
         bars = [
             bar("2026-08-14T10:05:00-04:00", 9.8, 10.2, 9.7, 10.1),

@@ -23,7 +23,7 @@
     "completed_15m_structure": []
   }],
   "security_status": {"robinhood_mcp_available": true, "boundary_ok": true, "forbidden_tools_available": []},
-  "account_status": {"agentic_account_count": 1, "reconciled": true, "account_equity": 100.0, "buying_power": 100.0, "unexpected_positions": 0, "unexpected_orders": 0},
+  "account_status": {"agentic_account_count": 1, "reconciled": true, "account_equity": 100.0, "buying_power": 100.0, "baseline_position_count": 0, "baseline_external_order_count": 0, "baseline_external_orders_present": false, "baseline_external_orders": []},
   "tool_call_count": {"total": 12, "run_scan": 1},
   "errors": [],
   "sol_escalation": true

@@ -63,6 +63,8 @@ def initial_state(session_date: str, timezone_name: str = "America/New_York", no
     }
     for field in STATE_LIST_FIELDS:
         state[field] = []
+    state["baseline_positions"] = []
+    state["baseline_external_orders"] = []
     return state
 
 
@@ -91,6 +93,25 @@ def validate_state_shape(state: Any, expected_date: str | None = None) -> None:
     for field in STATE_LIST_FIELDS:
         if not isinstance(state.get(field), list):
             raise StateCorruptionError(f"State field {field} must be a list")
+    baseline_positions = state.get("baseline_positions", [])
+    if not isinstance(baseline_positions, list):
+        raise StateCorruptionError("State field baseline_positions must be a list")
+    for item in baseline_positions:
+        if set(item) != {"attribution", "symbol", "quantity"} or item["attribution"] != "BASELINE_EXTERNAL":
+            raise StateCorruptionError("Invalid baseline position attribution")
+        if not isinstance(item["symbol"], str) or not item["symbol"] or not isinstance(item["quantity"], (int, float)) or item["quantity"] <= 0:
+            raise StateCorruptionError("Invalid baseline position")
+    baseline_orders = state.get("baseline_external_orders", [])
+    if not isinstance(baseline_orders, list):
+        raise StateCorruptionError("State field baseline_external_orders must be a list")
+    for item in baseline_orders:
+        if set(item) != {"attribution", "symbol", "side", "state"} or item["attribution"] != "BASELINE_EXTERNAL_ORDER":
+            raise StateCorruptionError("Invalid baseline external order attribution")
+        if not all(isinstance(item[key], str) and item[key] for key in ("symbol", "side", "state")):
+            raise StateCorruptionError("Invalid baseline external order")
+    for field in ("shadow_positions", "completed_shadow_trades"):
+        if any(item.get("attribution") != "SHADOW_AI" for item in state[field]):
+            raise StateCorruptionError(f"Invalid {field} attribution")
     if len(state["operation_ids"]) != len(set(state["operation_ids"])):
         raise StateCorruptionError("operation_ids must be unique")
     if not all(isinstance(item, str) and item for item in state["operation_ids"]):

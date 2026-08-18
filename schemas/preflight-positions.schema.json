@@ -3,14 +3,14 @@
   "title": "SHADOW preflight positions stage",
   "type": "object",
   "additionalProperties": false,
-  "required": ["passed", "account_classifications", "account_reconciled", "position_count", "unexpected_position_count", "unexpected_positions", "errors"],
+  "required": ["passed", "account_classifications", "account_reconciled", "baseline_position_count", "baseline_positions_present", "baseline_positions", "errors"],
   "properties": {
     "passed": {"type": "boolean"},
     "account_classifications": {"type": "array", "items": {"$ref": "#/$defs/accountClassification"}},
     "account_reconciled": {"type": "boolean"},
-    "position_count": {"type": "integer"},
-    "unexpected_position_count": {"type": "integer"},
-    "unexpected_positions": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["symbol", "quantity"], "properties": {"symbol": {"type": "string"}, "quantity": {"type": "number"}}}},
+    "baseline_position_count": {"type": "integer"},
+    "baseline_positions_present": {"type": "boolean"},
+    "baseline_positions": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["symbol", "quantity"], "properties": {"symbol": {"type": "string"}, "quantity": {"type": "number"}}}},
     "errors": {"type": "array", "items": {"type": "string"}}
   },
   "$defs": {"accountClassification": {"type": "object", "additionalProperties": false, "required": ["agentic_allowed", "brokerage_account_type", "management_type", "state", "deactivated", "permanently_deactivated"], "properties": {"agentic_allowed": {"type": "boolean"}, "brokerage_account_type": {"type": "string"}, "management_type": {"type": "string"}, "state": {"type": "string"}, "deactivated": {"type": "boolean"}, "permanently_deactivated": {"type": "boolean"}}}}
