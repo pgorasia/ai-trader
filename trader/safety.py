@@ -101,6 +101,7 @@ def lint_codex_output_schema(schema: Any, *, location: str = "<root>") -> None:
     if schema.get("additionalProperties") is not False:
         raise SchemaValidationError("Codex output schema root must set additionalProperties false")
     _lint_strict_objects(schema, location)
+    _lint_typed_literal_constraints(schema, location)
 
 
 def _lint_strict_objects(value: Any, path: str) -> None:
@@ -117,6 +118,46 @@ def _lint_strict_objects(value: Any, path: str) -> None:
     elif isinstance(value, list):
         for index, child in enumerate(value):
             _lint_strict_objects(child, f"{path}[{index}]")
+
+
+def _lint_typed_literal_constraints(value: Any, path: str) -> None:
+    """Require and verify explicit types for enum/const schema leaves."""
+    if isinstance(value, dict):
+        for keyword in ("const", "enum"):
+            if keyword not in value:
+                continue
+            declared = value.get("type")
+            if declared is None:
+                raise SchemaValidationError(
+                    f"Codex output schema literal at {path} using {keyword} must have an explicit type"
+                )
+            types = {declared} if isinstance(declared, str) else set(declared) if isinstance(declared, list) else set()
+            literals = [value[keyword]] if keyword == "const" else value[keyword]
+            if not isinstance(literals, list) or not literals or any(
+                not _literal_matches_declared_type(literal, types) for literal in literals
+            ):
+                raise SchemaValidationError(
+                    f"Codex output schema literal at {path} has a {keyword} incompatible with its explicit type"
+                )
+        for key, child in value.items():
+            _lint_typed_literal_constraints(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _lint_typed_literal_constraints(child, f"{path}[{index}]")
+
+
+def _literal_matches_declared_type(value: Any, types: set[Any]) -> bool:
+    if value is None:
+        return "null" in types
+    if isinstance(value, bool):
+        return "boolean" in types
+    if isinstance(value, int):
+        return "integer" in types or "number" in types
+    if isinstance(value, float):
+        return "number" in types
+    if isinstance(value, str):
+        return "string" in types
+    return "array" in types if isinstance(value, list) else "object" in types if isinstance(value, dict) else False
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -332,7 +373,7 @@ def offline_preflight(project_root: Path, config: dict[str, Any]) -> None:
     missing = [name for name in REQUIRED_PROJECT_FILES if not (project_root / name).is_file()]
     if missing:
         raise PreflightError(f"Required project files are missing: {', '.join(missing)}")
-    for path in sorted((project_root / "schemas").glob("*.schema.json")):
+    for path in sorted((project_root / "schemas").rglob("*.json")):
         validate_schema_file(path)
     risk = config["risk"]
     if float(risk["maximum_hypothetical_notional"]) > 35 or float(risk["maximum_planned_loss"]) > 1:

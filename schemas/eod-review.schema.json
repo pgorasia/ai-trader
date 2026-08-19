@@ -63,6 +63,7 @@
             "type": "string"
           },
           "classification": {
+            "type": "string",
             "enum": [
               "GOOD_AVOIDANCE",
               "MISSED_LATER_SETUP",

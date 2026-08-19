@@ -39,6 +39,7 @@
   ],
   "properties": {
     "decision": {
+      "type": "string",
       "enum": [
         "NO_TRADE",
         "SHADOW_TRADE_PLAN"
@@ -73,6 +74,7 @@
           "rejection_categories": {
             "type": "array",
             "items": {
+              "type": "string",
               "enum": [
                 "EXTENSION",
                 "NO_OBJECTIVE_ENTRY",
@@ -117,6 +119,10 @@
       ]
     },
     "catalyst_classification": {
+      "type": [
+        "string",
+        "null"
+      ],
       "enum": [
         "VERIFIED_FRESH",
         "RECENT_BUT_STALE",
@@ -128,6 +134,10 @@
       ]
     },
     "market_regime": {
+      "type": [
+        "string",
+        "null"
+      ],
       "enum": [
         "TRENDING_BULLISH",
         "TRENDING_BEARISH",
@@ -150,6 +160,10 @@
       ]
     },
     "entry_trigger_type": {
+      "type": [
+        "string",
+        "null"
+      ],
       "enum": [
         "TRADE_AT_OR_ABOVE",
         "COMPLETED_5M_CLOSE_AT_OR_ABOVE",

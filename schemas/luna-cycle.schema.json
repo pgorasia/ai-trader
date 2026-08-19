@@ -79,6 +79,7 @@
             "type": "string"
           },
           "classification": {
+            "type": "string",
             "enum": [
               "NEW",
               "MATERIALLY_REQUALIFIED",
@@ -135,6 +136,7 @@
                 ],
                 "properties": {
                   "event_type": {
+                    "type": "string",
                     "enum": [
                       "COMPLETED_BASE_BREAKOUT",
                       "PULLBACK_RECLAIM",
@@ -150,7 +152,8 @@
                     "type": "string"
                   },
                   "new_high_only": {
-                    "const": false
+                    "type": "boolean",
+                    "enum": [false]
                   }
                 }
               }
@@ -303,7 +306,8 @@
           "type": "number"
         },
         "complete": {
-          "const": true
+          "type": "boolean",
+          "enum": [true]
         }
       }
     }
