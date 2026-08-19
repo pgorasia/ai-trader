@@ -37,6 +37,12 @@ def failed_stream(*, trailing=True):
 
 
 class CodexFailureDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def bare_runner():
+        runner = CodexRunner.__new__(CodexRunner)
+        runner._last_run_diagnostics = {"mcp_teardown_warning": False, "diagnostic_codes": []}
+        return runner
+
     def diagnostics(self, *, returncode=17):
         with self.assertRaises(CodexRunError) as caught:
             parse_codex_jsonl(failed_stream(), returncode=returncode)
@@ -110,6 +116,36 @@ class CodexFailureDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("998877", message)
         self.assertNotIn("user@example.com", message)
         self.assertGreaterEqual(message.count("<redacted>"), 3)
+
+    def test_post_parse_foreign_mcp_diagnostic_retains_only_safe_identity_and_counts(self):
+        runner = self.bare_runner()
+        with self.assertRaises(CodexRunError) as caught:
+            runner._raise_observed_tool_error(
+                "Unexpected MCP activity from a non-Robinhood server",
+                {"foreign-server::read_file": 2, "robinhood-trading::get_equity_historicals": 1},
+                foreign_mcp=["foreign-server::read_file"],
+            )
+        diagnostics = caught.exception.diagnostics
+        self.assertEqual(diagnostics["foreign_mcp"], ["foreign-server::read_file"])
+        self.assertEqual(diagnostics["observed_tool_summary"], [
+            {"name": "foreign-server::read_file", "count": 2},
+            {"name": "robinhood-trading::get_equity_historicals", "count": 1},
+        ])
+        encoded = json.dumps(diagnostics)
+        self.assertNotIn("arguments", encoded); self.assertNotIn("result", encoded)
+
+    def test_post_parse_missing_tool_diagnostic_retains_missing_names_and_counts(self):
+        runner = self.bare_runner()
+        with self.assertRaises(CodexRunError) as caught:
+            runner._raise_observed_tool_error(
+                "Required Robinhood tool calls were not observed: get_portfolio",
+                {"robinhood-trading::get_accounts": 1},
+                missing_required_tools=["get_portfolio"],
+            )
+        self.assertEqual(caught.exception.diagnostics["missing_required_tools"], ["get_portfolio"])
+        self.assertEqual(caught.exception.diagnostics["observed_tool_summary"], [
+            {"name": "robinhood-trading::get_accounts", "count": 1},
+        ])
 
 
 if __name__ == "__main__":

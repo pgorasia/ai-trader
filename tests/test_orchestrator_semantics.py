@@ -168,7 +168,7 @@ class OrchestratorSemanticTests(unittest.TestCase):
 
     def test_luna_finalist_requires_observed_market_evidence(self):
         cycle = self.fixture("luna_candidate.json")
-        observed = {"get_accounts": 1, "get_portfolio": 1, "get_equity_orders": 1, "get_equity_positions": 1, "run_scan": 1}
+        observed = {"get_accounts": 1, "get_equity_orders": 1, "get_equity_positions": 1, "run_scan": 1}
         cycle["tool_call_count"]["total"] = sum(observed.values())
         with self.assertRaisesRegex(SchemaValidationError, "market-data evidence"):
             self.core._validate_luna(cycle, initial_state("2026-08-14"), self.session, 0, observed_tool_calls=observed)

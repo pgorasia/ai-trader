@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import tempfile
 import unittest
@@ -21,8 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeEodRunner:
-    def __init__(self, payload): self.payload = payload
-    def run(self, **kwargs): return CodexRunResult(data=self.payload, usage={"total_tokens": 100}, tool_calls={"get_equity_historicals": 1}, web_searches=0)
+    def __init__(self, payload): self.payload = payload; self.calls = []
+    def run(self, **kwargs): self.calls.append(kwargs); return CodexRunResult(data=self.payload, usage={"total_tokens": 100}, tool_calls={"get_equity_historicals": 1}, web_searches=0)
 
 
 class EodReadinessTests(unittest.TestCase):
@@ -135,11 +136,26 @@ class EodReadinessTests(unittest.TestCase):
     def test_eod_evaluation_writes_structured_and_markdown_companions(self):
         review = {"session_date": "2026-08-14", "timestamp": "2026-08-14T16:05:00-04:00", "symbol_bars": {}, "decision_reviews": [], "benchmark_closes": {"SPY": 700.0, "QQQ": 600.0}, "robinhood_tool_call_count": 1, "errors": []}
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); core = ShadowOrchestrator.__new__(ShadowOrchestrator)
+            root = Path(directory); (root / "methodology").mkdir(); methodology = "test eod methodology\n"
+            (root / "methodology/eod-v1.md").write_text(methodology, encoding="utf-8")
+            core = ShadowOrchestrator.__new__(ShadowOrchestrator)
             core.root = root; core.config = self.config; core.store = StateStore(root / "state"); core.runner = FakeEodRunner(review); core.monitor = ShadowPlanMonitor()
             state = initial_state("2026-08-14"); core.store.save(state); result = core.eod(state, self.session)
             self.assertTrue((root / "reports/2026-08-14-eod.json").is_file()); self.assertEqual(result["readiness"]["status"], "CONTINUE_SHADOW")
             self.assertTrue((root / "reports/2026-08-14-experiment.json").is_file())
+            supplied = core.runner.calls[0]["context"]["eod_methodology"]
+            self.assertEqual(supplied, {"version": "eod-v1", "text": methodology, "sha256": hashlib.sha256(methodology.encode()).hexdigest()})
+
+    def test_missing_or_empty_methodology_fails_before_codex(self):
+        review = {"unused": True}
+        for content in (None, "  \n"):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); core = ShadowOrchestrator.__new__(ShadowOrchestrator)
+                core.root = root; core.config = self.config; core.store = StateStore(root / "state"); core.runner = FakeEodRunner(review); core.monitor = ShadowPlanMonitor()
+                if content is not None:
+                    (root / "methodology").mkdir(); (root / "methodology/eod-v1.md").write_text(content, encoding="utf-8")
+                with self.assertRaises(Exception): core.eod(initial_state("2026-08-14"), self.session)
+                self.assertEqual(core.runner.calls, [])
 
     def test_duplicate_eod_review_rejected(self):
         review_item = {"symbol": "TEST", "decision_timestamp": "2026-08-14T10:03:00-04:00", "classification": "GOOD_AVOIDANCE", "subsequent_mfe_percent": 0.1, "subsequent_mae_percent": -0.1, "later_material_setup": False, "analysis": "x"}

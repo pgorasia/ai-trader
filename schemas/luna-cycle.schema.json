@@ -197,8 +197,6 @@
       "required": [
         "agentic_account_count",
         "reconciled",
-        "account_equity",
-        "buying_power",
         "baseline_position_count",
         "baseline_external_order_count",
         "baseline_external_orders_present",
@@ -210,18 +208,6 @@
         },
         "reconciled": {
           "type": "boolean"
-        },
-        "account_equity": {
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "buying_power": {
-          "type": [
-            "number",
-            "null"
-          ]
         },
         "baseline_position_count": {
           "type": "integer"

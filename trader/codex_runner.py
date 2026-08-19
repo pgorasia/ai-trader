@@ -31,6 +31,11 @@ _TOML_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 _TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
+def _safe_observed_tool_name(value: str) -> str:
+    """Retain only bounded operational server/tool identity metadata."""
+    return re.sub(r"[^a-z0-9_.:-]+", "_", value.strip().lower())[:200]
+
+
 def build_robinhood_enabled_tools_override(server_name: str, enabled_tools: frozenset[str]) -> str:
     """Build a Codex leaf-key override without replacing the base MCP table."""
     if not isinstance(server_name, str) or not _TOML_BARE_KEY.fullmatch(server_name):
@@ -177,9 +182,9 @@ class CodexRunner:
                     permitted_non_mcp = {"web_search"} if allow_web else set()
                     unexpected_non_mcp = sorted(name for name in parsed.tool_calls if "::" not in name and name not in permitted_non_mcp)
                     if foreign_mcp:
-                        raise CodexRunError("Unexpected MCP activity from a non-Robinhood server")
+                        self._raise_observed_tool_error("Unexpected MCP activity from a non-Robinhood server", parsed.tool_calls, foreign_mcp=foreign_mcp)
                     if unexpected_non_mcp:
-                        raise CodexRunError("Unexpected local or non-MCP tool activity was observed")
+                        self._raise_observed_tool_error("Unexpected local or non-MCP tool activity was observed", parsed.tool_calls)
                     robinhood_calls = {}
                     for observed, count in parsed.tool_calls.items():
                         server, separator, tool = observed.partition("::")
@@ -195,18 +200,18 @@ class CodexRunner:
                                 prohibited.append(observed)
                             robinhood_calls[tool] = robinhood_calls.get(tool, 0) + count
                     if prohibited:
-                        raise CodexRunError(f"Prohibited observed tool activity: {', '.join(prohibited)}")
+                        self._raise_observed_tool_error(f"Prohibited observed tool activity: {', '.join(prohibited)}", parsed.tool_calls)
                     missing = sorted(required_robinhood_tools - robinhood_calls.keys())
                     if missing:
-                        raise CodexRunError(f"Required Robinhood tool calls were not observed: {', '.join(missing)}")
+                        self._raise_observed_tool_error(f"Required Robinhood tool calls were not observed: {', '.join(missing)}", parsed.tool_calls, missing_required_tools=missing)
                     if exact_robinhood_tools:
                         non_mcp = sorted(name for name in parsed.tool_calls if "::" not in name)
                         unexpected = sorted(robinhood_calls.keys() - required_robinhood_tools)
                         duplicates = sorted(name for name in required_robinhood_tools if robinhood_calls.get(name) != 1)
                         if non_mcp:
-                            raise CodexRunError(f"Unexpected non-MCP tool calls were observed: {', '.join(non_mcp)}")
+                            self._raise_observed_tool_error(f"Unexpected non-MCP tool calls were observed: {', '.join(non_mcp)}", parsed.tool_calls)
                         if unexpected:
-                            raise CodexRunError(f"Unexpected Robinhood tool calls were observed: {', '.join(unexpected)}")
+                            self._raise_observed_tool_error(f"Unexpected Robinhood tool calls were observed: {', '.join(unexpected)}", parsed.tool_calls)
                         if duplicates:
                             raise CodexRunError(f"Required Robinhood tools must complete exactly once: {', '.join(duplicates)}")
                         self._validate_preflight_tool_order(parsed.events, self._shadow_boundary.server_name, required_robinhood_tools)
@@ -222,6 +227,24 @@ class CodexRunner:
                 break
             time.sleep(self.retry_backoff * attempt)
         raise CodexRunError(f"Codex read-only job failed after {attempt} attempt(s): {last_error}")
+
+    def _raise_observed_tool_error(self, message: str, tool_calls: dict[str, int], *,
+                                   foreign_mcp: list[str] | None = None,
+                                   missing_required_tools: list[str] | None = None) -> None:
+        diagnostics = {
+            "observed_tool_summary": [
+                {"name": _safe_observed_tool_name(name), "count": int(count)}
+                for name, count in sorted(tool_calls.items())
+            ],
+            "foreign_mcp": [_safe_observed_tool_name(name) for name in (foreign_mcp or [])],
+            "missing_required_tools": sorted(_safe_observed_tool_name(name) for name in (missing_required_tools or [])),
+        }
+        self._last_run_diagnostics = {
+            "mcp_teardown_warning": False,
+            "diagnostic_codes": [],
+            "codex_failure_diagnostics": diagnostics,
+        }
+        raise CodexRunError(message, diagnostics=diagnostics)
 
     def verify_shadow_boundary(self) -> ShadowBoundaryResult:
         self._shadow_boundary = verify_shadow_mcp_boundary(self.codex_config_path)

@@ -330,8 +330,6 @@ def _validate_removed_schema_invariants(data: dict[str, Any], schema_name: str) 
         for index, item in enumerate(external_orders): _symbol(item["symbol"], f"account_status.baseline_external_orders[{index}].symbol")
         if data["account_status"]["baseline_external_order_count"] != len(external_orders): raise SchemaValidationError("Stage-B baseline external order count does not match details")
         if data["account_status"]["baseline_external_orders_present"] != bool(external_orders): raise SchemaValidationError("Stage-B baseline external order presence does not match details")
-        for key in ("account_equity", "buying_power"):
-            if data["account_status"][key] is not None: _number(data["account_status"][key], key, minimum=0)
         for key, value in data["tool_call_count"].items(): _number(value, f"tool_call_count.{key}", minimum=0)
     elif schema_name == "senior-decision.schema.json":
         _aware_timestamp(data["decision_timestamp"], "decision_timestamp")

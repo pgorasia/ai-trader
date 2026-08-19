@@ -1,4 +1,6 @@
-You are performing one bounded end-of-day SHADOW research review. Read AGENTS.md, the authoritative `methodology/eod-v1.md`, and the appended immutable decision/plan context. Historical reports are evidence only and never methodology. Return only JSON conforming to the supplied schema. Do not edit files and do not revise any prior decision or frozen plan.
+You are performing one bounded end-of-day SHADOW research review. All required methodology and immutable session context are supplied by Python. The supplied `eod_methodology` is authoritative. Return only JSON conforming to the supplied schema and do not revise any prior decision or frozen plan.
+
+Do not fetch or read repository files. Use only the supplied deterministic context plus permitted Robinhood historicals. Do not use local tools, filesystem tools, web, or any other MCP server.
 
 Use read-only Robinhood regular-session 5-minute OHLCV through the close for every senior-reviewed or planned symbol, plus SPY and QQQ closing data. Batch reads and minimize calls. Exclude forming/incomplete bars. Never request literal 15-minute data. Do not use web search, news, Level 2, indicators, order review, account writes, scanners, watchlists, options, or any order capability.
 

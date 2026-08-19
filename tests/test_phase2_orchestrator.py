@@ -56,7 +56,7 @@ class Phase2OrchestratorTests(unittest.TestCase):
 
     @staticmethod
     def luna_tools():
-        return {"get_accounts": 1, "get_portfolio": 1, "get_equity_orders": 1, "get_equity_positions": 1, "run_scan": 1, "get_equity_quotes": 1, "get_equity_tradability": 1, "get_equity_historicals": 1, "get_equity_technical_indicators": 4}
+        return {"get_accounts": 1, "get_equity_orders": 1, "get_equity_positions": 1, "run_scan": 1, "get_equity_quotes": 1, "get_equity_tradability": 1, "get_equity_historicals": 1, "get_equity_technical_indicators": 4}
 
     def test_luna_one_second_before_cutoff_can_start_but_crossing_skips_sol(self):
         cycle = deepcopy(self.cycle); cycle["timestamp"] = "2026-08-14T15:39:59-04:00"
@@ -93,8 +93,8 @@ class Phase2OrchestratorTests(unittest.TestCase):
 
     def test_state_committed_before_cycle_report_crash(self):
         cycle = deepcopy(self.cycle); cycle["finalists"] = []; cycle["sol_escalation"] = False; cycle["timestamp"] = "2026-08-14T10:00:01-04:00"
-        cycle["tool_call_count"]["total"] = 5
-        runner = FakeRunner(cycle, tools={"get_accounts": 1, "get_portfolio": 1, "get_equity_orders": 1, "get_equity_positions": 1, "run_scan": 1}); clock = SequenceClock(datetime.fromisoformat("2026-08-14T10:00:00-04:00"), datetime.fromisoformat("2026-08-14T10:00:02-04:00"))
+        cycle["tool_call_count"]["total"] = 4
+        runner = FakeRunner(cycle, tools={"get_accounts": 1, "get_equity_orders": 1, "get_equity_positions": 1, "run_scan": 1}); clock = SequenceClock(datetime.fromisoformat("2026-08-14T10:00:00-04:00"), datetime.fromisoformat("2026-08-14T10:00:02-04:00"))
         with tempfile.TemporaryDirectory() as directory:
             core = self.core(directory, runner, clock); state = initial_state("2026-08-14")
             with patch("orchestrator.write_non_destructive_text", side_effect=OSError("crash")), self.assertRaises(OSError): core.run_luna_cycle(state, self.session, datetime.fromisoformat("2026-08-14T10:00:00-04:00"))

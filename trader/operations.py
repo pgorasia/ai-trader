@@ -88,6 +88,9 @@ def safe_failure_diagnostic(record: dict[str, Any], error: Exception, now: datet
                           ("turn_started_count", "turn_completed_count", "turn_failed_count", "structured_error_count")},
         "tool_summary": [{"tool": tool, "state": status, "count": count}
                          for (tool, status), count in sorted(lifecycle.items())],
+        "observed_tool_summary": supplied.get("observed_tool_summary", []),
+        "foreign_mcp": supplied.get("foreign_mcp", []),
+        "missing_required_tools": supplied.get("missing_required_tools", []),
         "teardown_classifier": {"reached": bool(supplied.get("teardown_classifier_reached", False)),
                                 "result": supplied.get("teardown_classifier_result"),
                                 "diagnostic_code": supplied.get("teardown_diagnostic_code")},

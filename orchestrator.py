@@ -294,7 +294,7 @@ class ShadowOrchestrator:
             schema_path=self.root / "schemas" / "luna-cycle.schema.json",
             model=self.config["models"]["luna"],
             context=context,
-            required_robinhood_tools=frozenset({"get_accounts", "get_portfolio", "get_equity_orders", "get_equity_positions", "run_scan"}),
+            required_robinhood_tools=frozenset({"get_accounts", "get_equity_orders", "get_equity_positions", "run_scan"}),
             allow_web=False, robinhood_enabled_tools=JOB_TOOL_CONTRACTS["STAGE_B"],
         )
         luna_ended = self._trusted_now()
@@ -463,10 +463,23 @@ class ShadowOrchestrator:
             write_non_destructive_text(self.root / "reports" / f"{state['session_date']}-eod.md", eod_markdown(state["session_date"], state["eod_review"], readiness, state["completed_shadow_trades"]))
             self._write_experiment_report(state["session_date"], readiness)
             return companion
+        methodology_path = self.root / "methodology" / "eod-v1.md"
+        try:
+            methodology_bytes = methodology_path.read_bytes()
+            methodology_text = methodology_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CodexRunError("EOD methodology is missing or unreadable") from exc
+        if not methodology_text.strip():
+            raise CodexRunError("EOD methodology is empty")
         context = {
             "session": self._session_context(session),
             "senior_decisions": [{key: value for key, value in item.items() if key not in {"cli_usage", "cli_tool_calls"}} for item in state["senior_decisions"]],
             "shadow_plans": state["shadow_plans"],
+            "eod_methodology": {
+                "version": "eod-v1",
+                "text": methodology_text,
+                "sha256": hashlib.sha256(methodology_bytes).hexdigest(),
+            },
         }
         result = self._run_ai_job(state, operation_id=eod_operation, operation_type="EOD",
             scheduled_for=session.eod_time, max_attempts=3,
@@ -680,7 +693,7 @@ class ShadowOrchestrator:
         if aware(cycle["timestamp"]).astimezone(ET).date().isoformat() != session.session_date:
             raise SchemaValidationError("Luna timestamp is outside the expected session date")
         if observed_tool_calls is not None:
-            required_once = {"get_accounts", "get_portfolio", "get_equity_orders", "get_equity_positions", "run_scan"}
+            required_once = {"get_accounts", "get_equity_orders", "get_equity_positions", "run_scan"}
             bad_counts = sorted(name for name in required_once if observed_tool_calls.get(name, 0) != 1)
             if bad_counts:
                 raise SchemaValidationError("Luna reconciliation and scan calls must each complete exactly once: " + ", ".join(bad_counts))

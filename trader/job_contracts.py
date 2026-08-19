@@ -9,7 +9,7 @@ JOB_TOOL_CONTRACTS: dict[str, frozenset[str]] = {
     "PREFLIGHT_POSITIONS": frozenset({"get_accounts", "get_equity_positions"}),
     "PREFLIGHT_ORDERS": frozenset({"get_accounts", "get_equity_orders"}),
     "STAGE_B": frozenset({
-        "get_accounts", "get_portfolio", "get_equity_orders", "get_equity_positions",
+        "get_accounts", "get_equity_orders", "get_equity_positions",
         "run_scan", "get_equity_quotes", "get_equity_tradability",
         "get_equity_historicals", "get_equity_technical_indicators",
     }),

@@ -54,7 +54,12 @@ class ApprovalAndContractTests(unittest.TestCase):
         self.assertTrue(all(tools <= APPROVED_SHADOW_ROBINHOOD_TOOLS for tools in JOB_TOOL_CONTRACTS.values()))
 
     def test_exact_per_job_exposure(self):
-        self.assertEqual(len(JOB_TOOL_CONTRACTS["STAGE_B"]), 9)
+        self.assertEqual(JOB_TOOL_CONTRACTS["PREFLIGHT_PORTFOLIO"], {"get_accounts", "get_portfolio"})
+        self.assertEqual(JOB_TOOL_CONTRACTS["STAGE_B"], {
+            "get_accounts", "get_equity_orders", "get_equity_positions", "run_scan",
+            "get_equity_quotes", "get_equity_tradability", "get_equity_historicals",
+            "get_equity_technical_indicators",
+        })
         self.assertEqual(JOB_TOOL_CONTRACTS["SOL_SENIOR"], {"get_equity_quotes", "get_equity_historicals"})
         self.assertEqual(JOB_TOOL_CONTRACTS["MONITOR"], {"get_equity_historicals"})
         self.assertEqual(JOB_TOOL_CONTRACTS["EOD"], {"get_equity_historicals"})
