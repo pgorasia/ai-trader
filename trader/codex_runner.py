@@ -69,7 +69,7 @@ class CodexRunner:
         self.retry_backoff = float(settings.get("retry_backoff_seconds", 2))
         self._last_run_diagnostics: dict[str, Any] = {"mcp_teardown_warning": False, "diagnostic_codes": []}
 
-    def build_command(self, model: str, schema_path: Path, output_path: Path, *, allow_web: bool, reasoning_effort: str | None = None, robinhood_enabled_tools: frozenset[str] | None = None) -> list[str]:
+    def build_command(self, model: str, schema_path: Path, output_path: Path, *, allow_web: bool, reasoning_effort: str | None = None, robinhood_enabled_tools: frozenset[str] | None = None, disable_all_mcp: bool = False, working_directory: Path | None = None) -> list[str]:
         command = [self.executable]
         if allow_web:
             command.append("--search")
@@ -80,7 +80,7 @@ class CodexRunner:
             "--sandbox",
             "read-only",
             "--cd",
-            str(self.project_root),
+            str((working_directory or self.project_root).resolve()),
             "--output-schema",
             str(schema_path.resolve()),
             "--output-last-message",
@@ -98,6 +98,8 @@ class CodexRunner:
         ])
         if reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
+        if disable_all_mcp:
+            command.extend(["--config", "mcp_servers={}"])
         if robinhood_enabled_tools is not None:
             override = build_robinhood_enabled_tools_override(self._shadow_boundary.server_name, robinhood_enabled_tools)
             command.extend(["--config", override])
@@ -106,9 +108,11 @@ class CodexRunner:
         command.append("-")
         return command
 
-    def run(self, *, prompt_path: Path, schema_path: Path, model: str, context: dict[str, Any], required_robinhood_tools: frozenset[str], allow_web: bool = False, reasoning_effort: str | None = None, exact_robinhood_tools: bool = False, robinhood_enabled_tools: frozenset[str] | None = None) -> CodexRunResult:
+    def run(self, *, prompt_path: Path, schema_path: Path, model: str, context: dict[str, Any], required_robinhood_tools: frozenset[str], allow_web: bool = False, reasoning_effort: str | None = None, exact_robinhood_tools: bool = False, robinhood_enabled_tools: frozenset[str] | None = None, disable_all_mcp: bool = False, working_directory: Path | None = None) -> CodexRunResult:
         if not hasattr(self, "_shadow_boundary"):
             raise CodexRunError("Deterministic SHADOW MCP boundary was not verified at startup")
+        if disable_all_mcp and (required_robinhood_tools or robinhood_enabled_tools is not None):
+            raise CodexRunError("MCP-disabled jobs cannot require or expose Robinhood tools")
         if robinhood_enabled_tools is not None:
             outside_policy = robinhood_enabled_tools - APPROVED_SHADOW_ROBINHOOD_TOOLS
             unavailable = robinhood_enabled_tools - self._shadow_boundary.enabled_tools
@@ -127,7 +131,7 @@ class CodexRunner:
             started_at = datetime.now(timezone.utc)
             with tempfile.TemporaryDirectory(prefix="ai-trader-codex-") as temp_directory:
                 output_path = Path(temp_directory) / "last-message.json"
-                command = self.build_command(model, schema_path, output_path, allow_web=allow_web, reasoning_effort=reasoning_effort, robinhood_enabled_tools=robinhood_enabled_tools)
+                command = self.build_command(model, schema_path, output_path, allow_web=allow_web, reasoning_effort=reasoning_effort, robinhood_enabled_tools=robinhood_enabled_tools, disable_all_mcp=disable_all_mcp, working_directory=working_directory)
                 try:
                     completed = subprocess.run(
                         command,

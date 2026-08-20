@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .market_calendar import ET
+from .codex_events import sanitize_diagnostic_text
 from .maintenance import LocalMaintenanceController
 from .models import TraderError
 from .state import atomic_write_json, validate_state_shape
@@ -19,10 +21,21 @@ from .state import atomic_write_json, validate_state_shape
 HEARTBEAT_SCHEMA_VERSION = 1
 HEARTBEAT_MAX_AGE = timedelta(minutes=3)
 LOGGER = logging.getLogger("ai_trader")
+_UNSAFE_DIAGNOSTIC_PAYLOAD = re.compile(
+    r"(?is)\b(prompt|tool[_ ]?(?:arguments?|results?)|oauth|raw[_ ]?(?:stdout|stderr))\s*[:=].*$"
+)
 
 
 def _audit(event: str, **values: Any) -> None:
     LOGGER.info("AI_TRADER event=%s%s", event, "".join(f" {key}={value}" for key, value in values.items()))
+
+
+def safe_daemon_error(error: Exception) -> dict[str, Any]:
+    """Return only bounded, sanitized exception metadata suitable for persistence."""
+    message = (sanitize_diagnostic_text(str(error)) if isinstance(error, TraderError)
+               else "Local session operation failed")
+    message = _UNSAFE_DIAGNOSTIC_PAYLOAD.sub(lambda match: f"{match.group(1)}=<redacted>", message)
+    return {"exception_class": type(error).__name__, "sanitized_error": {"message": message}}
 
 
 def git_commit(root: Path) -> str:
@@ -99,7 +112,8 @@ class DaemonSupervisor:
         _audit("DAEMON_STARTED", mode="SHADOW")
         while not self.stop_event.is_set():
             now = self.orchestrator._trusted_now()
-            self._recover_expired_session(now)
+            if self._recover_expired_session(now):
+                continue
             session = self._session_to_run(now)
             preflight_at = session.market_open - timedelta(minutes=self.preflight_lead_minutes)
             if now < preflight_at and not self.wait_until(preflight_at, "WAITING_FOR_PREFLIGHT"):
@@ -144,14 +158,16 @@ class DaemonSupervisor:
                 self.heartbeat.update("SESSION_COMPLETE", last_cycle=last_cycle, last_eod=last_eod)
                 _audit("SESSION_COMPLETE", session=session.session_date)
             except (TraderError, OSError, ValueError) as exc:
+                diagnostic = safe_daemon_error(exc)
+                safe_message = diagnostic["sanitized_error"]["message"]
                 self.local_maintenance.record_application_failure(
-                    "DAEMON_SESSION", type(exc).__name__
+                    "DAEMON_SESSION", f"{type(exc).__name__}:{safe_message}"
                 )
                 try:
                     failed = self.orchestrator.store.load(session.session_date, create=False)
                     failed.setdefault("errors", []).append({
                         "timestamp": self.orchestrator._trusted_now().isoformat(),
-                        "category": "DAEMON_SESSION", "message": type(exc).__name__, "resolved": False,
+                        "category": "DAEMON_SESSION", **diagnostic, "resolved": False,
                     })
                     self.orchestrator.store.save(failed)
                 except (TraderError, OSError, ValueError):
@@ -194,13 +210,11 @@ class DaemonSupervisor:
 
     @staticmethod
     def _eod_terminal(state: dict[str, Any]) -> bool:
-        if state.get("eod_completed") or state.get("legacy_recovery_state") == "LEGACY_RECOVERY_FINALIZED":
-            return True
-        return any(item.get("operation_type") == "EOD" and item.get("state") == "FAILED_TERMINAL"
-                   for item in state.get("ai_operations", []))
+        return bool(state.get("eod_completed")
+                    or state.get("legacy_recovery_state") == "LEGACY_RECOVERY_FINALIZED")
 
     def _recover_expired_session(self, now: datetime) -> bool:
-        """State-only startup recovery. This path must never invoke a runner or broker."""
+        """Recover post-close state, including bounded read-only EOD retries."""
         session = self.calendar.session_for(now.astimezone(ET).date())
         if session is None or now.astimezone(ET) < session.market_close:
             return False
@@ -210,6 +224,29 @@ class DaemonSupervisor:
         state = self.orchestrator.store.load(session.session_date, create=False)
         if self._eod_terminal(state):
             return False
+        eod_operation = next((item for item in state.get("ai_operations", [])
+                              if item.get("operation_type") == "EOD"), None)
+        if (eod_operation and eod_operation.get("state") == "RETRY_WAIT"
+                and int(eod_operation.get("attempt_number", 0)) < int(eod_operation.get("max_attempts", 0))):
+            retry_at = datetime.fromisoformat(eod_operation["next_retry_at"])
+            if now < retry_at:
+                if not self.wait_until(retry_at, "EOD_RETRY_WAIT"):
+                    return True
+                now = self.orchestrator._trusted_now()
+            _audit("EOD_RETRY", session=session.session_date, attempt=int(eod_operation["attempt_number"]) + 1)
+            try:
+                self.orchestrator.eod(state, session)
+            except TraderError:
+                refreshed = self.orchestrator.store.load(session.session_date, create=False)
+                current = next((item for item in refreshed.get("ai_operations", [])
+                                if item.get("operation_type") == "EOD"), None)
+                if current and current.get("state") == "RETRY_WAIT":
+                    return True
+                if not current or current.get("state") != "FAILED_TERMINAL":
+                    raise
+                state = refreshed
+            else:
+                return True
         _audit("POST_CLOSE_RECOVERY", session=session.session_date)
         circuit_open = state.get("ai_circuit", {}).get("status") == "OPEN"
         has_operation_structure = bool(state.get("ai_operations"))
@@ -225,8 +262,15 @@ class DaemonSupervisor:
             state["post_close_recovery_state"] = status
         state["eod_completed"] = True
         state["session_terminal"] = True
+        terminal_eod = next((item for item in state.get("ai_operations", [])
+                             if item.get("operation_type") == "EOD"
+                             and item.get("state") == "FAILED_TERMINAL"), None)
+        if terminal_eod:
+            status = "POST_CLOSE_RECOVERY_FINALIZED_AFTER_AI_FAILURE"
+            state["post_close_recovery_state"] = status
         state["eod_review"] = {"session_date": session.session_date, "status": status,
-                               "metrics_retained": True, "recovery_reason": "STARTED_AFTER_MARKET_CLOSE"}
+                               "metrics_retained": True, "recovery_reason": "STARTED_AFTER_MARKET_CLOSE",
+                               "ai_eod_outcome": "FAILED_TERMINAL" if terminal_eod else "NOT_COMPLETED"}
         self.orchestrator.store.save(state)
         next_session = self.calendar.next_session(session.eod_time + timedelta(seconds=1))
         next_action = self._preflight_at(next_session)

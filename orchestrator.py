@@ -7,7 +7,9 @@ import logging
 import math
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import time as time_module
 import unittest
 import uuid
@@ -15,7 +17,7 @@ from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from trader.codex_runner import CodexRunner
@@ -76,6 +78,27 @@ def aware(value: str) -> datetime:
     return parsed
 
 
+def _directory_snapshot(directory: Path) -> dict[str, str]:
+    if not directory.exists():
+        return {}
+    return {path.relative_to(directory).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(directory.rglob("*")) if path.is_file()}
+
+
+def _production_snapshot(root: Path) -> dict[str, dict[str, str]]:
+    return {name: _directory_snapshot(root / name) for name in ("state", "reports")}
+
+
+def _service_active(service: str) -> bool:
+    try:
+        completed = subprocess.run(["systemctl", "is-active", "--quiet", service],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=10, shell=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
 class ShadowOrchestrator:
     def __init__(self, root: Path = ROOT, runner: CodexRunner | None = None, calendar: EquityMarketCalendar | None = None, clock: TrustedClock | None = None) -> None:
         self.root = root.resolve()
@@ -94,7 +117,8 @@ class ShadowOrchestrator:
         return (clock.now() if clock else datetime.now(ET)).astimezone(ET)
 
     def _run_ai_job(self, state: dict[str, Any], *, operation_id: str, operation_type: str,
-                    scheduled_for: datetime, max_attempts: int = 1, **runner_args: Any):
+                    scheduled_for: datetime, max_attempts: int = 1,
+                    result_validator: Callable[[Any], None] | None = None, **runner_args: Any):
         now = self._trusted_now(); ensure_controls(state)
         record = prepare_operation(state, operation_id, operation_type, scheduled_for, max_attempts)
         circuit_open = state["ai_circuit"]["status"] == "OPEN"
@@ -108,11 +132,14 @@ class ShadowOrchestrator:
         self.store.save(state)
         try:
             result = self.runner.run(**runner_args)
+            if result_validator is not None:
+                result_validator(result)
         except CodexRunError as exc:
             ended = self._trusted_now(); counts["codex_failed_attempts"] = counts.get("codex_failed_attempts", 0) + 1
             if operation_type == "EOD": counts["eod_failed_attempts"] = counts.get("eod_failed_attempts", 0) + 1
             if operation_type == "STAGE_B": counts["stage_b_failed_slots"] = counts.get("stage_b_failed_slots", 0) + 1
-            decision = fail_operation(record, exc, ended, self.runner.safe_diagnostics())
+            diagnostics = self.runner.safe_diagnostics() if callable(getattr(self.runner, "safe_diagnostics", None)) else {}
+            decision = fail_operation(record, exc, ended, diagnostics)
             opened = record_ai_failure(state, exc, ended,
                 int(self.config.get("circuit_breaker", {}).get("consecutive_failures", 3)),
                 int(self.config.get("circuit_breaker", {}).get("total_failures", 5)))
@@ -463,26 +490,11 @@ class ShadowOrchestrator:
             write_non_destructive_text(self.root / "reports" / f"{state['session_date']}-eod.md", eod_markdown(state["session_date"], state["eod_review"], readiness, state["completed_shadow_trades"]))
             self._write_experiment_report(state["session_date"], readiness)
             return companion
-        methodology_path = self.root / "methodology" / "eod-v1.md"
-        try:
-            methodology_bytes = methodology_path.read_bytes()
-            methodology_text = methodology_bytes.decode("utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise CodexRunError("EOD methodology is missing or unreadable") from exc
-        if not methodology_text.strip():
-            raise CodexRunError("EOD methodology is empty")
-        context = {
-            "session": self._session_context(session),
-            "senior_decisions": [{key: value for key, value in item.items() if key not in {"cli_usage", "cli_tool_calls"}} for item in state["senior_decisions"]],
-            "shadow_plans": state["shadow_plans"],
-            "eod_methodology": {
-                "version": "eod-v1",
-                "text": methodology_text,
-                "sha256": hashlib.sha256(methodology_bytes).hexdigest(),
-            },
-        }
+        context = self._eod_context(state, session)
         result = self._run_ai_job(state, operation_id=eod_operation, operation_type="EOD",
             scheduled_for=session.eod_time, max_attempts=3,
+            result_validator=lambda candidate: self._validate_eod_review(
+                candidate.data, state, candidate.web_searches),
             prompt_path=self.root / "prompts" / "eod-review.md",
             schema_path=self.root / "schemas" / "eod-review.schema.json",
             model=self.config["models"]["luna"],
@@ -492,23 +504,9 @@ class ShadowOrchestrator:
         )
         review = result.data
         review["cli_diagnostics"] = result.diagnostics
-        if result.web_searches or review["errors"] or review["session_date"] != state["session_date"]:
-            raise CodexRunError("EOD review failed data-integrity checks")
-        if any(review["benchmark_closes"].get(symbol) is None for symbol in ("SPY", "QQQ")):
-            raise CodexRunError("EOD review requires both SPY and QQQ benchmark closes")
-        expected_reviews = [
-            (rejection["symbol"], decision["decision_timestamp"])
-            for decision in state["senior_decisions"]
-            for rejection in decision["rejections"]
-        ]
-        actual_reviews = [(item["symbol"], item["decision_timestamp"]) for item in review["decision_reviews"]]
-        if Counter(expected_reviews) != Counter(actual_reviews) or len(actual_reviews) != len(set(actual_reviews)):
-            raise CodexRunError("EOD review did not cover every senior rejection exactly once")
         updated = []
         for plan in state["shadow_plans"]:
             symbol = plan["original_plan"]["symbol"]
-            if symbol not in review["symbol_bars"]:
-                raise CodexRunError(f"EOD review omitted required bars for {symbol}")
             bars = review["symbol_bars"][symbol]
             fixed = self.monitor.evaluate(plan, bars, session.market_close)
             updated.append(self.monitor.evaluate_trailing(fixed, bars, session.market_close))
@@ -530,18 +528,59 @@ class ShadowOrchestrator:
         self._write_experiment_report(state["session_date"], readiness)
         return companion
 
+    def _eod_context(self, state: dict[str, Any], session) -> dict[str, Any]:
+        methodology_path = self.root / "methodology" / "eod-v1.md"
+        try:
+            methodology_bytes = methodology_path.read_bytes()
+            methodology_text = methodology_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CodexRunError("EOD methodology is missing or unreadable") from exc
+        if not methodology_text.strip():
+            raise CodexRunError("EOD methodology is empty")
+        return {
+            "session": self._session_context(session),
+            "senior_decisions": [{key: value for key, value in item.items() if key not in {"cli_usage", "cli_tool_calls"}} for item in state["senior_decisions"]],
+            "shadow_plans": state["shadow_plans"],
+            "eod_methodology": {
+                "version": "eod-v1",
+                "text": methodology_text,
+                "sha256": hashlib.sha256(methodology_bytes).hexdigest(),
+            },
+        }
+
+    def _validate_eod_review(self, review: dict[str, Any], state: dict[str, Any], web_searches: int) -> None:
+        if web_searches:
+            raise CodexRunError("EOD review observed prohibited tool activity")
+        if review["errors"] or review["session_date"] != state["session_date"]:
+            raise CodexRunError("EOD review failed data-integrity checks")
+        if any(review["benchmark_closes"].get(symbol) is None for symbol in ("SPY", "QQQ")):
+            raise CodexRunError("EOD review requires both SPY and QQQ benchmark closes")
+        expected_reviews = [
+            (rejection["symbol"], decision["decision_timestamp"])
+            for decision in state["senior_decisions"]
+            for rejection in decision["rejections"]
+        ]
+        actual_reviews = [(item["symbol"], item["decision_timestamp"]) for item in review["decision_reviews"]]
+        if Counter(expected_reviews) != Counter(actual_reviews) or len(actual_reviews) != len(set(actual_reviews)):
+            raise CodexRunError("EOD review did not cover every senior rejection exactly once")
+        for plan in state["shadow_plans"]:
+            symbol = plan["original_plan"]["symbol"]
+            if symbol not in review["symbol_bars"]:
+                raise CodexRunError(f"EOD review omitted required bars for {symbol}")
+
     def _finalize_eod_without_ai(self, state: dict[str, Any], session, status: str) -> dict[str, Any]:
         operation_id = f"eod:{state['session_date']}"
         record = prepare_operation(state, operation_id, "EOD", session.eod_time, 3)
         if record["state"] not in {"COMPLETED", "FAILED_TERMINAL"}:
             record.update({"state": "FAILED_TERMINAL", "completed_at": self._trusted_now().isoformat(), "next_retry_at": None})
+        ai_failed = record["state"] == "FAILED_TERMINAL" and bool(record.get("failure_diagnostics"))
         review = {"session_date": state["session_date"], "status": status,
                   "failure_summary": {"errors": len(state.get("errors", [])),
                                       "ai_failures": state.get("ai_circuit", {}).get("failure_count", 0)},
-                  "metrics_retained": True}
+                  "metrics_retained": True,
+                  "ai_eod_outcome": "FAILED_TERMINAL" if ai_failed else "NOT_COMPLETED"}
         state.update({"eod_completed": True, "eod_review": review, "session_terminal": True})
         if operation_id not in state["operation_ids"]: state["operation_ids"].append(operation_id)
-        state["usage_counts"]["eod_completed_runs"] = state["usage_counts"].get("eod_completed_runs", 0) + 1
         self.store.save(state); audit("SESSION_COMPLETE", eod=status)
         return {"session_date": state["session_date"], "agent_review": review,
                 "shadow_plans": state["shadow_plans"], "completed_shadow_trades": state["completed_shadow_trades"],
@@ -624,7 +663,7 @@ class ShadowOrchestrator:
                 self._record_failure(state, "SESSION_CYCLE", exc)
                 self.store.save(state)
         self._wait_until(session.eod_time)
-        if not state.get("eod_completed"):
+        while not state.get("eod_completed"):
             persisted_eod = find_operation(state, f"eod:{state['session_date']}")
             if persisted_eod and persisted_eod.get("state") == "RETRY_WAIT" and persisted_eod.get("next_retry_at"):
                 retry_at = aware(persisted_eod["next_retry_at"])
@@ -643,6 +682,8 @@ class ShadowOrchestrator:
                     audit("EOD_FAILED_TERMINAL")
                     self._finalize_eod_without_ai(state, session, "SKIPPED_AI_FAILED_TERMINAL")
                     return
+                if persisted_eod and persisted_eod.get("state") == "RETRY_WAIT":
+                    continue
                 raise
 
     def run_eod_only(self, day: datetime | None = None) -> dict[str, Any]:
@@ -653,6 +694,90 @@ class ShadowOrchestrator:
         state = self.store.load(session.session_date, create=False)
         self.preflight(state, current)
         return self.eod(state, session)
+
+    def smoke_stage_b_replay(self, session_date: str) -> dict[str, Any]:
+        state_path = self.root / "state" / f"{session_date}.json"
+        before = hashlib.sha256(state_path.read_bytes()).hexdigest()
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        matches = [cycle for cycle in persisted["cycles"] if cycle.get("scheduled_for", "").startswith(f"{session_date}T14:50:")]
+        if len(matches) != 1:
+            raise PreflightError("Stage-B smoke requires exactly one persisted 14:50 cycle")
+        schema_path = self.root / "schemas" / "luna-cycle.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        cycle = {key: deepcopy(matches[0][key]) for key in schema["required"]}
+        cycle["account_status"] = {key: cycle["account_status"][key]
+                                   for key in schema["properties"]["account_status"]["required"]}
+        observed = {key: int(value) for key, value in matches[0].get("cli_tool_calls", {}).items() if key != "get_portfolio"}
+        cycle["tool_call_count"] = {"total": sum(observed.values()), "run_scan": observed.get("run_scan", 0)}
+        validate_json(cycle, schema_path)
+        session = self.calendar.session_for(datetime.strptime(session_date, "%Y-%m-%d").date())
+        if session is None:
+            raise PreflightError("Stage-B smoke session is not an exchange session")
+        replay_state = deepcopy(persisted)
+        replay_state["cooldowns"] = {}
+        self._validate_luna(cycle, replay_state, session, 0, expected_cycle_id=cycle["cycle_id"], observed_tool_calls=observed)
+        if hashlib.sha256(state_path.read_bytes()).hexdigest() != before:
+            raise StateCorruptionError("Stage-B smoke modified production session state")
+        return {"status": "PASS", "smoke": "STAGE_B_REPLAY", "session": session_date,
+                "network_used": False, "production_state_modified": False}
+
+    def smoke_luna_schema(self) -> dict[str, Any]:
+        schema_path = self.root / "schemas" / "luna-cycle.schema.json"
+        minimal = {
+            "cycle_id": "schema-smoke", "session_date": "2026-01-02",
+            "scanner": {"name": "synthetic", "id": "synthetic"},
+            "timestamp": "2026-01-02T15:00:00Z", "scanner_total": 0,
+            "symbols_processed": [], "finalists": [],
+            "security_status": {"robinhood_mcp_available": False, "boundary_ok": True, "forbidden_tools_available": []},
+            "account_status": {"agentic_account_count": 0, "reconciled": False,
+                "baseline_position_count": 0, "baseline_external_order_count": 0,
+                "baseline_external_orders_present": False, "baseline_external_orders": []},
+            "tool_call_count": {"total": 0, "run_scan": 0}, "errors": [], "sol_escalation": False,
+        }
+        state_before = _production_snapshot(self.root)
+        with tempfile.TemporaryDirectory(prefix="ai-trader-luna-schema-") as directory:
+            temporary = Path(directory)
+            prompt = temporary / "prompt.md"
+            prompt.write_text(
+                "Do not read any file or call any tool. Return only this exact synthetic JSON object:\n"
+                + json.dumps(minimal, sort_keys=True), encoding="utf-8")
+            result = self.runner.run(prompt_path=prompt, schema_path=schema_path,
+                model=self.config["models"]["luna"], context={}, required_robinhood_tools=frozenset(),
+                allow_web=False, disable_all_mcp=True, working_directory=self.root)
+        if result.tool_calls or result.web_searches:
+            raise CodexRunError("Luna schema smoke observed prohibited tool activity")
+        if _production_snapshot(self.root) != state_before:
+            raise StateCorruptionError("Luna schema smoke modified production state or reports")
+        return {"status": "PASS", "smoke": "LUNA_SCHEMA", "model_invoked": True,
+                "robinhood_calls": 0, "production_state_modified": False}
+
+    def smoke_eod(self, session_date: str) -> dict[str, Any]:
+        if _service_active("ai-trader.service"):
+            raise PreflightError("EOD smoke refused because ai-trader.service is active")
+        state_path = self.root / "state" / f"{session_date}.json"
+        state_hash = hashlib.sha256(state_path.read_bytes()).hexdigest()
+        reports_before = _directory_snapshot(self.root / "reports")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not state.get("eod_completed"):
+            raise PreflightError("EOD smoke requires a completed historical session")
+        session = self.calendar.session_for(datetime.strptime(session_date, "%Y-%m-%d").date())
+        if session is None:
+            raise PreflightError("EOD smoke session is not an exchange session")
+        context = self._eod_context(state, session)
+        with tempfile.TemporaryDirectory(prefix=f"ai-trader-eod-smoke-{session_date}-") as directory:
+            result = self.runner.run(prompt_path=self.root / "prompts" / "eod-review.md",
+                schema_path=self.root / "schemas" / "eod-review.schema.json",
+                model=self.config["models"]["luna"], context=context,
+                required_robinhood_tools=JOB_TOOL_CONTRACTS["EOD"], allow_web=False,
+                robinhood_enabled_tools=JOB_TOOL_CONTRACTS["EOD"],
+                working_directory=self.root)
+        self._validate_eod_review(result.data, state, result.web_searches)
+        if hashlib.sha256(state_path.read_bytes()).hexdigest() != state_hash:
+            raise StateCorruptionError("EOD smoke modified production session state")
+        if _directory_snapshot(self.root / "reports") != reports_before:
+            raise StateCorruptionError("EOD smoke modified normal production reports")
+        return {"status": "PASS", "smoke": "EOD_READ_ONLY", "session": session_date,
+                "allowed_robinhood_tools": ["get_equity_historicals"], "production_state_modified": False}
 
     def status(self, now: datetime | None = None) -> dict[str, Any]:
         current = (now or datetime.now(ET)).astimezone(ET)
@@ -986,12 +1111,22 @@ def parser() -> argparse.ArgumentParser:
     group.add_argument("--daemon", action="store_true")
     group.add_argument("--health-check", action="store_true")
     group.add_argument("--validate-unattended-config", action="store_true")
+    group.add_argument("--smoke-stage-b-replay", action="store_true")
+    group.add_argument("--smoke-luna-schema", action="store_true")
+    group.add_argument("--smoke-eod", action="store_true")
+    result.add_argument("--session", help="historical YYYY-MM-DD session for a replay or EOD smoke")
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    args = parser().parse_args(argv)
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    session_smoke = args.smoke_stage_b_replay or args.smoke_eod
+    if session_smoke and not args.session:
+        argument_parser.error("--session is required for this smoke command")
+    if args.session and not session_smoke:
+        argument_parser.error("--session is only valid with --smoke-stage-b-replay or --smoke-eod")
     if args.self_test:
         return 0 if run_self_test() else 1
     if args.health_check:
@@ -1005,6 +1140,23 @@ def main(argv: list[str] | None = None) -> int:
         result = validate_unattended_config(ROOT)
         print(json.dumps(result, indent=2), file=sys.stdout if result["status"] == "PASS" else sys.stderr)
         return 0 if result["status"] == "PASS" else 2
+    if args.smoke_stage_b_replay or args.smoke_luna_schema or args.smoke_eod:
+        try:
+            config = load_config(ROOT / "config" / "strategy.yaml")
+            if config.get("mode") != "SHADOW":
+                raise PreflightError("Smoke commands require SHADOW mode")
+            orchestrator = ShadowOrchestrator()
+            if args.smoke_stage_b_replay:
+                result = orchestrator.smoke_stage_b_replay(args.session)
+            elif args.smoke_luna_schema:
+                result = orchestrator.smoke_luna_schema()
+            else:
+                result = orchestrator.smoke_eod(args.session)
+            print(json.dumps(result, indent=2))
+            return 0
+        except (TraderError, OSError, ValueError) as exc:
+            print(f"FAIL CLOSED: {sanitize_diagnostic_text(str(exc))}", file=sys.stderr)
+            return 2
     try:
         started_at = datetime.now(ET)
         lock = SingleInstanceLock(ROOT / ".runtime" / "orchestrator.lock", started_at.date().isoformat(), started_at)

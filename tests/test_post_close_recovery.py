@@ -9,9 +9,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from trader.automation import DaemonSupervisor, Heartbeat
+from trader.automation import DaemonSupervisor, Heartbeat, safe_daemon_error
 from trader.maintenance import AIMaintenanceGate, LocalMaintenanceController, process_ai_queue
 from trader.market_calendar import EquityMarketCalendar
+from trader.models import CodexRunError
 from trader.operations import prepare
 from trader.state import StateStore, initial_state
 
@@ -54,13 +55,52 @@ class PostCloseRecoveryTests(unittest.TestCase):
             selected = supervisor._session_to_run(at("2026-08-17T19:46:00-04:00"))
             self.assertEqual(selected.session_date, "2026-08-18")
 
-    def test_completed_and_failed_terminal_eod_are_terminal(self):
+    def test_only_finalized_eod_is_session_terminal(self):
         completed = initial_state("2026-08-17"); completed["eod_completed"] = True
         failed = initial_state("2026-08-17")
         record = prepare(failed, "eod:2026-08-17", "EOD", at("2026-08-17T16:05:00-04:00"), 3)
         record["state"] = "FAILED_TERMINAL"
         self.assertTrue(DaemonSupervisor._eod_terminal(completed))
-        self.assertTrue(DaemonSupervisor._eod_terminal(failed))
+        self.assertFalse(DaemonSupervisor._eod_terminal(failed))
+
+    def test_retry_wait_is_not_replaced_by_post_close_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); orchestrator, supervisor = self.supervisor(root)
+            state = initial_state("2026-08-17")
+            record = prepare(state, "eod:2026-08-17", "EOD", at("2026-08-17T16:05:00-04:00"), 3)
+            record.update({"state": "RETRY_WAIT", "attempt_number": 1,
+                           "next_retry_at": "2026-08-17T19:47:00-04:00"})
+            orchestrator.store.save(state)
+            with patch.object(supervisor, "wait_until", return_value=False):
+                self.assertTrue(supervisor._recover_expired_session(at("2026-08-17T19:46:00-04:00")))
+            recovered = orchestrator.store.load("2026-08-17", create=False)
+            self.assertEqual(recovered["ai_operations"][0]["state"], "RETRY_WAIT")
+            self.assertFalse(recovered["eod_completed"])
+            self.assertIsNone(recovered.get("eod_review"))
+
+    def test_terminal_ai_failure_fallback_preserves_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); orchestrator, supervisor = self.supervisor(root)
+            state = initial_state("2026-08-17")
+            record = prepare(state, "eod:2026-08-17", "EOD", at("2026-08-17T16:05:00-04:00"), 3)
+            diagnostic = {"sanitized_error": {"message": "EOD review requires both SPY and QQQ benchmark closes"}}
+            record.update({"state": "FAILED_TERMINAL", "attempt_number": 3,
+                           "failure_diagnostics": [diagnostic]})
+            orchestrator.store.save(state)
+            self.assertTrue(supervisor._recover_expired_session(at("2026-08-17T19:46:00-04:00")))
+            recovered = orchestrator.store.load("2026-08-17", create=False)
+            self.assertEqual(recovered["eod_review"]["status"],
+                             "POST_CLOSE_RECOVERY_FINALIZED_AFTER_AI_FAILURE")
+            self.assertEqual(recovered["ai_operations"][0]["failure_diagnostics"], [diagnostic])
+
+    def test_daemon_diagnostic_preserves_safe_message_without_payloads(self):
+        diagnostic = safe_daemon_error(CodexRunError(
+            "EOD review requires both SPY and QQQ benchmark closes prompt=secret tool_args=private"))
+        self.assertEqual(diagnostic["exception_class"], "CodexRunError")
+        self.assertIn("both SPY and QQQ", diagnostic["sanitized_error"]["message"])
+        serialized = json.dumps(diagnostic).lower()
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("private", serialized)
 
     def test_post_close_legacy_recovery_is_local_and_schedules_next_session(self):
         with tempfile.TemporaryDirectory() as directory:

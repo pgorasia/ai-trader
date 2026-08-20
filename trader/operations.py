@@ -12,6 +12,12 @@ from .models import CodexRunError
 OPERATION_STATES = frozenset({"PENDING", "STARTED", "RETRY_WAIT", "COMPLETED", "FAILED_TERMINAL"})
 TRANSIENT = re.compile(r"rate.?limit|temporar(?:y|ily)|service unavailable|connection (?:reset|aborted)|http 50[23]", re.I)
 NONRETRYABLE = re.compile(r"security|approval|config|schema|invariant|prohibited|unexpected .*tool|invalid_request|contract", re.I)
+EOD_CONTENT_FAILURE = re.compile(
+    r"^(?:EOD review failed data-integrity checks|"
+    r"EOD review requires both SPY and QQQ benchmark closes|"
+    r"EOD review did not cover every senior rejection exactly once|"
+    r"EOD review omitted required bars for [A-Za-z0-9.\-]+)$"
+)
 
 
 def ensure_controls(state: dict[str, Any]) -> None:
@@ -61,7 +67,9 @@ def complete(record: dict[str, Any], now: datetime) -> None:
 
 def retry_eligible(error: Exception) -> bool:
     text = sanitize_diagnostic_text(str(error))
-    return isinstance(error, CodexRunError) and bool(TRANSIENT.search(text)) and not NONRETRYABLE.search(text)
+    return (isinstance(error, CodexRunError)
+            and bool(TRANSIENT.search(text) or EOD_CONTENT_FAILURE.fullmatch(text))
+            and not NONRETRYABLE.search(text))
 
 
 def safe_failure_diagnostic(record: dict[str, Any], error: Exception, now: datetime,
