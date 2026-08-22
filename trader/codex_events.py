@@ -21,6 +21,10 @@ _SECRET_TEXT = re.compile(
 )
 
 
+_CODEX_USAGE_LIMIT = re.compile(
+    r"(?:you['’]?ve hit your usage limit|purchase more credits)", re.IGNORECASE
+)
+
 @dataclass(frozen=True)
 class ParsedEventStream:
     events: list[dict[str, Any]]
@@ -54,6 +58,12 @@ def parse_codex_jsonl(stdout: str, *, returncode: int = 0, allow_nonzero: bool =
 
     diagnostics = _failure_diagnostics(events, returncode)
     if diagnostics["structured_error_count"]:
+        structured = diagnostics.get("structured_error")
+        if isinstance(structured, dict) and structured.get("code") == "CODEX_USAGE_LIMIT":
+            raise CodexRunError(
+                "CODEX_USAGE_LIMIT: Codex account usage is exhausted",
+                diagnostics=diagnostics,
+            )
         raise CodexRunError("Codex emitted terminal failure event: error", diagnostics=diagnostics)
     if returncode != 0 and not allow_nonzero:
         raise CodexRunError(f"Codex exited nonzero ({returncode}); structured output is not accepted", diagnostics=diagnostics)
@@ -263,6 +273,9 @@ def _sanitize_structured_error(event: dict[str, Any]) -> dict[str, Any]:
     for key, value in fields:
         if isinstance(value, (str, int)) and not isinstance(value, bool):
             result[key] = _sanitize_text(str(value)) if isinstance(value, str) else value
+    message = result.get("message")
+    if isinstance(message, str) and _CODEX_USAGE_LIMIT.search(message):
+        result["code"] = "CODEX_USAGE_LIMIT"
     return result
 
 

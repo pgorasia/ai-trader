@@ -168,10 +168,19 @@ class CodexRunner:
                     try:
                         parsed = parse_codex_jsonl(jsonl, returncode=completed.returncode, allow_nonzero=warning)
                     except CodexRunError as exc:
+                        structured_message = ""
                         if exc.diagnostics is not None:
                             exc.diagnostics["teardown_classifier_reached"] = teardown_reached
                             exc.diagnostics["teardown_classifier_result"] = warning if teardown_reached else None
                             self._last_run_diagnostics = {"mcp_teardown_warning": False, "diagnostic_codes": [], "codex_failure_diagnostics": exc.diagnostics}
+                            structured = exc.diagnostics.get("structured_error")
+                            if isinstance(structured, dict):
+                                structured_message = str(structured.get("message") or "")
+                        retry_text = sanitize_diagnostic_text(structured_message or str(exc))
+                        if attempt < attempts and TRANSIENT_READ_PATTERNS.search(retry_text):
+                            last_error = retry_text
+                            time.sleep(self.retry_backoff * attempt)
+                            continue
                         raise
                 else:
                     parsed = None

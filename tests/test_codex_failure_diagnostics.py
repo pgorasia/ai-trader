@@ -9,6 +9,7 @@ from unittest.mock import patch
 from trader.codex_events import parse_codex_jsonl
 from trader.codex_runner import CodexRunner
 from trader.models import CodexRunError
+from trader.operations import retry_eligible
 from trader.shadow_boundary import ShadowBoundaryResult
 
 
@@ -58,6 +59,25 @@ class CodexFailureDiagnosticsTests(unittest.TestCase):
         self.assertIn("Bearer <redacted>", error["message"])
         self.assertNotIn("abc", json.dumps(diagnostics))
         self.assertNotIn("token123", json.dumps(diagnostics))
+
+    def test_usage_limit_has_stable_nonretryable_code(self):
+        message = (
+            "You've hit your usage limit. Upgrade to Pro, purchase more credits "
+            "or try again at Aug 27th, 2026 5:16 PM."
+        )
+        stream = line(
+            {"type": "thread.started", "thread_id": "opaque-thread"},
+            {"type": "turn.started"},
+            {"type": "error", "message": message},
+            {"type": "turn.failed", "error": {"message": message}},
+        )
+        with self.assertRaisesRegex(CodexRunError, r"^CODEX_USAGE_LIMIT:") as caught:
+            parse_codex_jsonl(stream, returncode=1)
+        self.assertEqual(
+            caught.exception.diagnostics["structured_error"]["code"],
+            "CODEX_USAGE_LIMIT",
+        )
+        self.assertFalse(retry_eligible(caught.exception))
 
     def test_sensitive_fields_and_tool_bodies_are_never_persisted(self):
         encoded = json.dumps(self.diagnostics())

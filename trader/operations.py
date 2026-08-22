@@ -11,7 +11,7 @@ from .models import CodexRunError
 
 OPERATION_STATES = frozenset({"PENDING", "STARTED", "RETRY_WAIT", "COMPLETED", "FAILED_TERMINAL"})
 TRANSIENT = re.compile(r"rate.?limit|temporar(?:y|ily)|service unavailable|connection (?:reset|aborted)|http 50[23]", re.I)
-NONRETRYABLE = re.compile(r"security|approval|config|schema|invariant|prohibited|unexpected .*tool|invalid_request|contract", re.I)
+NONRETRYABLE = re.compile(r"security|approval|config|schema|invariant|prohibited|unexpected .*tool|invalid_request|contract|CODEX_USAGE_LIMIT|usage limit|purchase more credits", re.I)
 EOD_CONTENT_FAILURE = re.compile(
     r"^(?:EOD review failed data-integrity checks|"
     r"EOD review requires both SPY and QQQ benchmark closes|"

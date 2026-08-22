@@ -139,7 +139,7 @@ class ShadowOrchestrator:
             result = self.runner.run(**runner_args)
             if result_validator is not None:
                 result_validator(result)
-        except CodexRunError as exc:
+        except TraderError as exc:
             ended = self._trusted_now(); counts["codex_failed_attempts"] = counts.get("codex_failed_attempts", 0) + 1
             if operation_type == "EOD": counts["eod_failed_attempts"] = counts.get("eod_failed_attempts", 0) + 1
             if operation_type == "STAGE_B": counts["stage_b_failed_slots"] = counts.get("stage_b_failed_slots", 0) + 1
@@ -415,21 +415,23 @@ class ShadowOrchestrator:
                 "risk": self.config["risk"],
                 "immutable_prior_rejections": self._cooldown_context(state, aware(cycle["timestamp"])),
             }
+            def validate_senior_result(observed) -> None:
+                ended = self._trusted_now()
+                self._validate_senior(
+                    observed.data, [finalist], state, session, observed.web_searches,
+                    observed_tool_calls=observed.tool_calls, observed_start=sol_started,
+                    observed_end=ended, allow_research_concurrency=True,
+                )
             result = self._run_ai_job(state, operation_id=decision_operation, operation_type="SOL",
                 scheduled_for=sol_started,
                 prompt_path=self.root / "prompts" / "sol-senior.md",
                 schema_path=self.root / "schemas" / "senior-decision.schema.json",
                 model=self.config["models"]["sol"], reasoning_effort=self.config["models"]["sol_reasoning_effort"],
-                context=context, required_robinhood_tools=JOB_TOOL_CONTRACTS["SOL_SENIOR"], allow_web=True,
+                context=context, result_validator=validate_senior_result,
+                required_robinhood_tools=JOB_TOOL_CONTRACTS["SOL_SENIOR"], allow_web=True,
                 robinhood_enabled_tools=JOB_TOOL_CONTRACTS["SOL_SENIOR"],
             )
-            sol_ended = self._trusted_now()
             decision = result.data
-            decision["web_search_count"] = result.web_searches
-            decision["robinhood_tool_call_count"] = sum(result.tool_calls.values())
-            self._validate_senior(decision, [finalist], state, session, result.web_searches, observed_tool_calls=result.tool_calls, observed_start=sol_started, observed_end=sol_ended, allow_research_concurrency=True)
-            if decision["decision"] == "SHADOW_TRADE_PLAN" and self._trusted_now() >= session.latest_entry:
-                raise PreflightError("Trusted clock reached latest-entry cutoff before Shadow plan acceptance")
             decision.update({
                 "source_cycle_id": source_id, "parent_cycle_id": cycle["cycle_id"], "research_rank": rank,
                 "cli_usage": result.usage, "cli_tool_calls": result.tool_calls, "cli_diagnostics": result.diagnostics,
@@ -477,11 +479,21 @@ class ShadowOrchestrator:
             "timestamp": now.astimezone(ET).isoformat(),
             "plans": [{"plan_id": item["plan_id"], "symbol": item["original_plan"]["symbol"], "start_time": item["original_plan"]["decision_timestamp"]} for item in active],
         }
+        def validate_monitor_result(observed) -> None:
+            if observed.web_searches or observed.data["errors"]:
+                raise CodexRunError("Shadow monitor returned a prohibited web call or read error")
+            missing = sorted(
+                plan["original_plan"]["symbol"]
+                for plan in active
+                if plan["original_plan"]["symbol"] not in observed.data["symbol_bars"]
+            )
+            if missing:
+                raise CodexRunError("Shadow monitor omitted bars for " + ", ".join(missing))
         result = self._run_ai_job(state, operation_id=monitor_operation, operation_type="MONITOR", scheduled_for=now,
             prompt_path=self.root / "prompts" / "shadow-monitor.md",
             schema_path=self.root / "schemas" / "shadow-monitor.schema.json",
             model=self.config["models"]["luna"],
-            context=context,
+            context=context, result_validator=validate_monitor_result,
             required_robinhood_tools=JOB_TOOL_CONTRACTS["MONITOR"],
             allow_web=False, robinhood_enabled_tools=JOB_TOOL_CONTRACTS["MONITOR"],
         )
@@ -511,9 +523,6 @@ class ShadowOrchestrator:
         eod_operation = f"eod:{state['session_date']}"
         ensure_controls(state)
         persisted = find_operation(state, eod_operation)
-        if state["ai_circuit"]["status"] == "OPEN" or (persisted and persisted.get("state") == "FAILED_TERMINAL"):
-            return self._finalize_eod_without_ai(state, session,
-                "SKIPPED_CIRCUIT_OPEN" if state["ai_circuit"]["status"] == "OPEN" else "SKIPPED_AI_FAILED_TERMINAL")
         if eod_operation in state["operation_ids"]:
             if not state.get("eod_completed") or not isinstance(state.get("eod_review"), dict):
                 raise StateCorruptionError("Persisted EOD operation has incomplete provenance")
@@ -523,6 +532,9 @@ class ShadowOrchestrator:
             write_non_destructive_text(self.root / "reports" / f"{state['session_date']}-eod.md", eod_markdown(state["session_date"], state["eod_review"], readiness, state["completed_shadow_trades"]))
             self._write_experiment_report(state["session_date"], readiness)
             return companion
+        if state["ai_circuit"]["status"] == "OPEN" or (persisted and persisted.get("state") == "FAILED_TERMINAL"):
+            return self._finalize_eod_without_ai(state, session,
+                "SKIPPED_CIRCUIT_OPEN" if state["ai_circuit"]["status"] == "OPEN" else "SKIPPED_AI_FAILED_TERMINAL")
         context = self._eod_context(state, session)
         result = self._run_ai_job(state, operation_id=eod_operation, operation_type="EOD",
             scheduled_for=session.eod_time, max_attempts=3,
