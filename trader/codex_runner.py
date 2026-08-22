@@ -159,7 +159,7 @@ class CodexRunner:
                 if completed.stderr:
                     ordered_output += completed.stderr
                 jsonl, stderr = self._split_ordered_output(ordered_output)
-                warning = self._recognized_teardown(stderr)
+                warning, teardown_count = self._recognized_teardown_lines(stderr)
                 teardown_reached = bool(stderr.strip())
                 if stderr.strip() and not warning:
                     last_error = self._safe_error(stderr, jsonl)
@@ -223,6 +223,8 @@ class CodexRunner:
                     validate_json(data, schema_path)
                     data = normalize_codex_output(data, schema_path.name)
                     diagnostics = {"mcp_teardown_warning": warning, "diagnostic_codes": [ROBINHOOD_TEARDOWN_CODE] if warning else []}
+                    if warning:
+                        diagnostics["recognized_teardown_count"] = teardown_count
                     self._last_run_diagnostics = diagnostics
                     return CodexRunResult(data=data, events=parsed.events, usage=parsed.usage, tool_calls=robinhood_calls, web_searches=parsed.web_searches, attempts=attempt, started_at=started_at, ended_at=ended_at, diagnostics=diagnostics)
 
@@ -310,19 +312,27 @@ class CodexRunner:
 
     @staticmethod
     def _recognized_teardown(stderr: str | None) -> bool:
-        if not stderr or not stderr.strip():
-            return False
-        text = " ".join(stderr.replace("\r", "").split())
+        return CodexRunner._recognized_teardown_lines(stderr)[0]
+
+    @staticmethod
+    def _recognized_teardown_line(line: str) -> bool:
+        text = " ".join(line.replace("\r", "").split())
         text = _TEARDOWN_PREFIX.sub("", text, count=1)
         text = _TEARDOWN_SESSION.sub(" session_id=<redacted>", text, count=1)
         return text == _TEARDOWN_TEMPLATE
 
     @staticmethod
+    def _recognized_teardown_lines(stderr: str | None) -> tuple[bool, int]:
+        lines = [line for line in (stderr or "").splitlines() if line.strip()]
+        if not lines:
+            return False, 0
+        recognized = [CodexRunner._recognized_teardown_line(line) for line in lines]
+        return all(recognized), sum(recognized)
+
+    @staticmethod
     def _split_ordered_output(output: str) -> tuple[str, str]:
         json_lines: list[str] = []
         stderr_lines: list[str] = []
-        stderr_seen = False
-        interleaved = False
         for raw in output.splitlines():
             if not raw.strip():
                 continue
@@ -331,13 +341,9 @@ class CodexRunner:
             except json.JSONDecodeError:
                 value = None
             if isinstance(value, dict) and isinstance(value.get("type"), str):
-                interleaved |= stderr_seen
                 json_lines.append(raw)
             else:
-                stderr_seen = True
                 stderr_lines.append(raw)
-        if interleaved:
-            stderr_lines.append("structured output occurred after stderr")
         suffix = "\n" if json_lines else ""
         return "\n".join(json_lines) + suffix, "\n".join(stderr_lines)
 

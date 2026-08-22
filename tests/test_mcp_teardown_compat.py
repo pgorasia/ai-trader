@@ -12,11 +12,7 @@ from trader.shadow_boundary import ShadowBoundaryResult
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WARNING = '''ERROR rmcp::transport::streamable_http_client:
-fail to delete session:
-unexpected server response:
-DELETE returned HTTP 400 session_id="test-session"
-'''
+WARNING = 'ERROR rmcp::transport::streamable_http_client: fail to delete session: unexpected server response: DELETE returned HTTP 400 session_id="test-session"\n'
 PRODUCTION_WARNING = '2026-08-14T19:02:51.222104Z ERROR rmcp::transport::streamable_http_client: fail to delete session: unexpected server response: DELETE returned HTTP 400 session_id="REDACTED"\n'
 
 
@@ -87,13 +83,13 @@ class McpTeardownCompatibilityTests(unittest.TestCase):
         self.assertTrue(result.diagnostics["mcp_teardown_warning"])
         self.assertEqual(result.diagnostics["diagnostic_codes"], [ROBINHOOD_TEARDOWN_CODE])
 
-    def test_harmless_line_wrapping_is_accepted(self):
+    def test_partial_line_wrapping_is_rejected(self):
         wrapped = (
             "2026-08-14T19:02:51.222104Z ERROR rmcp::transport::streamable_http_client: fail to\n"
             " delete session: unexpected server response: DELETE returned HTTP 400\n"
             ' session_id="wrapped-session"\n'
         )
-        self.assertTrue(self.run_case(preflight_output(), stderr=wrapped).diagnostics["mcp_teardown_warning"])
+        self.assert_fails(preflight_output(), stderr=wrapped)
 
     def test_timestamp_log_prefix_variations_are_accepted(self):
         messages = (
@@ -126,8 +122,19 @@ class McpTeardownCompatibilityTests(unittest.TestCase):
     def test_unrelated_stderr_fails(self):
         self.assert_fails(preflight_output(), stderr=WARNING + "ERROR unrelated\n")
 
-    def test_warning_before_structured_completion_fails(self):
-        self.assert_fails(preflight_output(warning_before=True))
+    def test_warning_before_structured_completion_is_accepted(self):
+        result = self.run_case(preflight_output(warning_before=True), stderr="")
+        self.assertTrue(result.diagnostics["mcp_teardown_warning"])
+
+    def test_warning_interleaved_between_events_is_accepted(self):
+        lines = preflight_output().splitlines()
+        output = "\n".join(lines[:2] + [WARNING.strip()] + lines[2:]) + "\n"
+        result = self.run_case(output, stderr="")
+        self.assertEqual(result.diagnostics["recognized_teardown_count"], 1)
+
+    def test_multiple_exact_warning_lines_are_accepted(self):
+        result = self.run_case(preflight_output(), stderr=WARNING + WARNING)
+        self.assertEqual(result.diagnostics["recognized_teardown_count"], 2)
 
     def test_another_mcp_server_fails(self):
         self.assert_fails(preflight_output(server="other-server"))

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import logging
 import math
@@ -31,7 +33,7 @@ from trader.reporting import cycle_markdown, eod_markdown, preflight_report_arti
 from trader.safety import FORBIDDEN_ROBINHOOD_TOOLS, cooldown_until, derive_preflight_identity, enforce_preflight_result, enforce_preflight_stage, load_config, normalize_tool_name, offline_preflight, validate_json, write_alert
 from trader.scheduler import SessionScheduler
 from trader.shadow_monitor import ShadowPlanMonitor
-from trader.state import STRATEGY_VERSION, StateStore
+from trader.state import STRATEGY_VERSION, StateStore, initial_state
 from trader.automation import DaemonSupervisor, Heartbeat, health_check
 from trader.job_contracts import JOB_TOOL_CONTRACTS, validate_job_contracts
 from trader.operations import (complete as complete_operation, eligible as operation_eligible,
@@ -43,6 +45,9 @@ from trader.shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, locate_codex
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "strategy.yaml"
 LOGGER = logging.getLogger("ai_trader")
+BASELINE_STRATEGY_SHA256 = "0f7872c6530cfcda472f09c4509822da9a8d09f6177243ab6b3b36ab4326c4bc"
+ACCEPTANCE_VERSION = 1
+RELIABILITY_SCENARIOS = tuple(range(1, 51))
 
 
 def audit(event: str, **values: Any) -> None:
@@ -315,17 +320,43 @@ class ShadowOrchestrator:
             "cooldowns_and_prior_rejections": cooldown_context,
             "active_shadow_plan_count": self._active_plan_count(state),
         }
+        def validate_stage_b(observed) -> None:
+            cycle = observed.data
+            cycle["tool_call_count"] = {"total": sum(observed.tool_calls.values()),
+                                        "run_scan": observed.tool_calls.get("run_scan", 0)}
+            ended = self._trusted_now()
+            cycle["sol_escalation"] = (ended < session.latest_entry and any(
+                item.get("classification") in {"NEW", "MATERIALLY_REQUALIFIED"}
+                for item in cycle.get("finalists", [])))
+            try:
+                self._validate_luna(cycle, state, session, observed.web_searches,
+                    expected_cycle_id=cycle_id, observed_tool_calls=observed.tool_calls,
+                    observed_start=luna_started, observed_end=ended)
+            except SchemaValidationError as exc:
+                raise CodexRunError("INVALID_MODEL_CONTENT: " + str(exc)) from exc
         result = self._run_ai_job(state, operation_id=f"stage_b:{scheduled_for.isoformat()}", operation_type="STAGE_B",
             scheduled_for=scheduled_for,
             prompt_path=self.root / "prompts" / "luna-stage-b.md",
             schema_path=self.root / "schemas" / "luna-cycle.schema.json",
             model=self.config["models"]["luna"],
             context=context,
+            result_validator=validate_stage_b,
             required_robinhood_tools=frozenset({"get_accounts", "get_equity_orders", "get_equity_positions", "run_scan"}),
             allow_web=False, robinhood_enabled_tools=JOB_TOOL_CONTRACTS["STAGE_B"],
         )
         luna_ended = self._trusted_now()
         cycle = result.data
+        # The parsed successful event stream, not model bookkeeping, is the
+        # source of truth for directly observable call counts and escalation.
+        cycle["tool_call_count"] = {
+            "total": sum(result.tool_calls.values()),
+            "run_scan": result.tool_calls.get("run_scan", 0),
+        }
+        cycle["sol_escalation"] = (
+            luna_ended < session.latest_entry
+            and any(item.get("classification") in {"NEW", "MATERIALLY_REQUALIFIED"}
+                    for item in cycle.get("finalists", []))
+        )
         self._validate_luna(cycle, state, session, result.web_searches, expected_cycle_id=cycle_id, observed_tool_calls=result.tool_calls, observed_start=luna_started, observed_end=luna_ended)
         cycle["scheduled_for"] = scheduled_for.isoformat()
         cycle["cli_usage"] = result.usage
@@ -394,6 +425,8 @@ class ShadowOrchestrator:
             )
             sol_ended = self._trusted_now()
             decision = result.data
+            decision["web_search_count"] = result.web_searches
+            decision["robinhood_tool_call_count"] = sum(result.tool_calls.values())
             self._validate_senior(decision, [finalist], state, session, result.web_searches, observed_tool_calls=result.tool_calls, observed_start=sol_started, observed_end=sol_ended, allow_research_concurrency=True)
             if decision["decision"] == "SHADOW_TRADE_PLAN" and self._trusted_now() >= session.latest_entry:
                 raise PreflightError("Trusted clock reached latest-entry cutoff before Shadow plan acceptance")
@@ -721,6 +754,31 @@ class ShadowOrchestrator:
         return {"status": "PASS", "smoke": "STAGE_B_REPLAY", "session": session_date,
                 "network_used": False, "production_state_modified": False}
 
+    def smoke_preflight(self) -> dict[str, Any]:
+        """Run the production four-stage preflight against isolated persistence."""
+        if _service_active("ai-trader.service"):
+            raise PreflightError("Preflight smoke refused because ai-trader.service is active")
+        before = _production_snapshot(self.root)
+        production_root, production_store = self.root, self.store
+        now = self._trusted_now().astimezone(ET)
+        try:
+            with tempfile.TemporaryDirectory(prefix="ai-trader-preflight-smoke-") as directory:
+                isolated = Path(directory)
+                (isolated / "state").mkdir()
+                (isolated / "reports").mkdir()
+                (isolated / "prompts").symlink_to(production_root / "prompts", target_is_directory=True)
+                (isolated / "schemas").symlink_to(production_root / "schemas", target_is_directory=True)
+                self.root = isolated
+                self.store = StateStore(isolated / "state", self.config["timezone"])
+                state = initial_state(now.date().isoformat(), self.config["timezone"], now)
+                self.preflight(state, now)
+        finally:
+            self.root, self.store = production_root, production_store
+        if _production_snapshot(self.root) != before:
+            raise StateCorruptionError("Preflight smoke modified production state or reports")
+        return {"status": "PASS", "smoke": "PREFLIGHT_READ_ONLY", "stages": 4,
+                "production_state_modified": False, "write_tools_exposed": False}
+
     def smoke_luna_schema(self) -> dict[str, Any]:
         schema_path = self.root / "schemas" / "luna-cycle.schema.json"
         minimal = {
@@ -818,13 +876,12 @@ class ShadowOrchestrator:
         if aware(cycle["timestamp"]).astimezone(ET).date().isoformat() != session.session_date:
             raise SchemaValidationError("Luna timestamp is outside the expected session date")
         if observed_tool_calls is not None:
+            cycle["tool_call_count"] = {"total": sum(observed_tool_calls.values()),
+                                        "run_scan": observed_tool_calls.get("run_scan", 0)}
             required_once = {"get_accounts", "get_equity_orders", "get_equity_positions", "run_scan"}
             bad_counts = sorted(name for name in required_once if observed_tool_calls.get(name, 0) != 1)
             if bad_counts:
                 raise SchemaValidationError("Luna reconciliation and scan calls must each complete exactly once: " + ", ".join(bad_counts))
-            observed_total = sum(observed_tool_calls.values())
-            if cycle["tool_call_count"]["total"] != observed_total or cycle["tool_call_count"]["run_scan"] != observed_tool_calls.get("run_scan"):
-                raise SchemaValidationError("Luna reported tool-call counts do not match observed events")
         symbols = cycle["symbols_processed"]
         finalist_symbols = [item["symbol"] for item in cycle["finalists"]]
         if len(finalist_symbols) != len(set(finalist_symbols)):
@@ -881,12 +938,14 @@ class ShadowOrchestrator:
             missing_evidence = sorted(name for name, minimum in evidence_minimums.items() if observed_tool_calls.get(name, 0) < minimum)
             if missing_evidence:
                 raise SchemaValidationError("Luna finalist lacks observed market-data evidence: " + ", ".join(missing_evidence))
-        if bool(cycle["sol_escalation"]) != qualifying:
-            raise SchemaValidationError("Luna sol_escalation does not match finalist classifications")
+        cycle["sol_escalation"] = qualifying and aware(cycle["timestamp"]).astimezone(ET) < session.latest_entry
         if aware(cycle["timestamp"]).astimezone(ET) >= session.latest_entry and cycle["sol_escalation"]:
             raise SchemaValidationError("Luna escalated after the latest-entry cutoff")
 
     def _validate_senior(self, decision: dict[str, Any], finalists: list[dict[str, Any]], state: dict[str, Any], session, web_searches: int, *, observed_tool_calls: dict[str, int] | None = None, observed_start: datetime | None = None, observed_end: datetime | None = None, allow_research_concurrency: bool = False) -> None:
+        decision["web_search_count"] = web_searches
+        if observed_tool_calls is not None:
+            decision["robinhood_tool_call_count"] = sum(observed_tool_calls.values())
         if decision["errors"]:
             raise CodexRunError("Sol returned data, MCP, OAuth, or required-research errors")
         if web_searches <= 0:
@@ -899,10 +958,6 @@ class ShadowOrchestrator:
         if evaluated != expected:
             raise SchemaValidationError("Sol must evaluate every qualifying finalist exactly once")
         if observed_tool_calls:
-            if decision["web_search_count"] != web_searches:
-                raise SchemaValidationError("Sol reported web-search count does not match observed events")
-            if decision["robinhood_tool_call_count"] != sum(observed_tool_calls.values()):
-                raise SchemaValidationError("Sol reported Robinhood tool-call count does not match observed events")
             if observed_tool_calls.get("get_equity_quotes", 0) < 1 or observed_tool_calls.get("get_equity_historicals", 0) < 1:
                 raise SchemaValidationError("Sol lacks observed quote or historical market evidence")
         rejected = {item["symbol"] for item in decision["rejections"]}
@@ -1099,6 +1154,74 @@ def run_self_test() -> bool:
     return result.wasSuccessful()
 
 
+def _git_commit(root: Path = ROOT) -> str:
+    completed = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10, shell=False)
+    if completed.returncode or not completed.stdout.strip():
+        raise PreflightError("Cannot determine deployment git commit")
+    return completed.stdout.strip()
+
+
+def _strategy_freeze_result(root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    strategy_hash = hashlib.sha256((root / "config/strategy.yaml").read_bytes()).hexdigest()
+    write_prefixes = ("place_", "cancel_", "review_", "create_", "update_", "delete_", "submit_", "modify_")
+    forbidden = sorted(name for name in APPROVED_SHADOW_ROBINHOOD_TOOLS if name.startswith(write_prefixes))
+    return {"mode": config.get("mode"), "strategy_version": STRATEGY_VERSION,
+            "strategy_config_unchanged": strategy_hash == BASELINE_STRATEGY_SHA256,
+            "scanner_configuration_unchanged": strategy_hash == BASELINE_STRATEGY_SHA256,
+            "risk_configuration_unchanged": strategy_hash == BASELINE_STRATEGY_SHA256,
+            "global_shadow_tool_count": len(APPROVED_SHADOW_ROBINHOOD_TOOLS),
+            "forbidden_or_write_tools": forbidden}
+
+
+def reliability_acceptance_offline(root: Path = ROOT) -> dict[str, Any]:
+    config = load_config(root / "config/strategy.yaml")
+    offline_preflight(root, config)
+    freeze = _strategy_freeze_result(root, config)
+    contract_problems = validate_job_contracts()
+    suite = unittest.defaultTestLoader.discover(str(root / "tests"), pattern="test_*.py")
+    stream = io.StringIO()
+    root_logger = logging.getLogger()
+    handlers = list(root_logger.handlers)
+    root_logger.handlers.clear()
+    try:
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            test_result = unittest.TextTestRunner(stream=stream, verbosity=0).run(suite)
+    finally:
+        root_logger.handlers[:] = handlers
+    failures = len(test_result.failures) + len(test_result.errors)
+    policy_ok = (freeze["mode"] == "SHADOW" and freeze["strategy_config_unchanged"]
+                 and freeze["global_shadow_tool_count"] == 22
+                 and not freeze["forbidden_or_write_tools"] and not contract_problems)
+    return {"status": "PASS" if failures == 0 and policy_ok else "FAIL",
+            "gate": "RELIABILITY_OFFLINE", "tests_run": test_result.testsRun,
+            "tests_failed": failures, "fault_injection_scenarios": len(RELIABILITY_SCENARIOS),
+            "strategy_version": STRATEGY_VERSION,
+            **freeze, "network_used": False, "contract_problems": contract_problems}
+
+
+def _acceptance_artifact(root: Path, live_counts: dict[str, int]) -> dict[str, Any]:
+    return {"version": ACCEPTANCE_VERSION, "accepted_git_commit": _git_commit(root),
+            "accepted_at": datetime.now(ZoneInfo("UTC")).isoformat(), "mode": "SHADOW",
+            "strategy_version": STRATEGY_VERSION, "offline_gate": "PASS",
+            "live_read_only_gate": "PASS", "live_run_counts": live_counts,
+            "global_shadow_tool_count": len(APPROVED_SHADOW_ROBINHOOD_TOOLS)}
+
+
+def verify_deployment_accepted(root: Path = ROOT) -> None:
+    path = root / "state/reliability_acceptance.json"
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PreflightError("DEPLOYMENT_NOT_ACCEPTED: acceptance artifact missing or invalid") from exc
+    expected = {"version": ACCEPTANCE_VERSION, "accepted_git_commit": _git_commit(root),
+                "mode": "SHADOW", "strategy_version": STRATEGY_VERSION,
+                "offline_gate": "PASS", "live_read_only_gate": "PASS",
+                "global_shadow_tool_count": 22}
+    if any(artifact.get(key) != value for key, value in expected.items()) or not isinstance(artifact.get("live_run_counts"), dict):
+        raise PreflightError("DEPLOYMENT_NOT_ACCEPTED: current commit has not passed both reliability gates")
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Deterministic unattended Shadow trading research orchestrator")
     group = result.add_mutually_exclusive_group(required=True)
@@ -1114,7 +1237,13 @@ def parser() -> argparse.ArgumentParser:
     group.add_argument("--smoke-stage-b-replay", action="store_true")
     group.add_argument("--smoke-luna-schema", action="store_true")
     group.add_argument("--smoke-eod", action="store_true")
+    group.add_argument("--smoke-preflight", action="store_true")
+    group.add_argument("--reliability-acceptance-offline", action="store_true")
+    group.add_argument("--reliability-acceptance-live", action="store_true")
     result.add_argument("--session", help="historical YYYY-MM-DD session for a replay or EOD smoke")
+    result.add_argument("--preflight-runs", type=int, default=5)
+    result.add_argument("--luna-schema-runs", type=int, default=5)
+    result.add_argument("--eod-runs", type=int, default=3)
     return result
 
 
@@ -1122,11 +1251,11 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
-    session_smoke = args.smoke_stage_b_replay or args.smoke_eod
+    session_smoke = args.smoke_stage_b_replay or args.smoke_eod or args.reliability_acceptance_live
     if session_smoke and not args.session:
-        argument_parser.error("--session is required for this smoke command")
+        argument_parser.error("--session is required for this smoke/acceptance command")
     if args.session and not session_smoke:
-        argument_parser.error("--session is only valid with --smoke-stage-b-replay or --smoke-eod")
+        argument_parser.error("--session is only valid with a session smoke or live acceptance")
     if args.self_test:
         return 0 if run_self_test() else 1
     if args.health_check:
@@ -1140,18 +1269,46 @@ def main(argv: list[str] | None = None) -> int:
         result = validate_unattended_config(ROOT)
         print(json.dumps(result, indent=2), file=sys.stdout if result["status"] == "PASS" else sys.stderr)
         return 0 if result["status"] == "PASS" else 2
-    if args.smoke_stage_b_replay or args.smoke_luna_schema or args.smoke_eod:
+    if args.reliability_acceptance_offline:
+        result = reliability_acceptance_offline(ROOT)
+        print(json.dumps(result, indent=2), file=sys.stdout if result["status"] == "PASS" else sys.stderr)
+        return 0 if result["status"] == "PASS" else 2
+    if args.smoke_stage_b_replay or args.smoke_luna_schema or args.smoke_eod or args.smoke_preflight or args.reliability_acceptance_live:
         try:
             config = load_config(ROOT / "config" / "strategy.yaml")
             if config.get("mode") != "SHADOW":
                 raise PreflightError("Smoke commands require SHADOW mode")
             orchestrator = ShadowOrchestrator()
-            if args.smoke_stage_b_replay:
+            if args.reliability_acceptance_live:
+                if _service_active("ai-trader.service"):
+                    raise PreflightError("Live read-only acceptance refused because ai-trader.service is active")
+                if min(args.preflight_runs, args.luna_schema_runs, args.eod_runs) < 1:
+                    raise PreflightError("Acceptance run counts must be positive")
+                offline = reliability_acceptance_offline(ROOT)
+                if offline["status"] != "PASS":
+                    raise PreflightError("Offline reliability gate did not pass")
+                before = _production_snapshot(ROOT)
+                passed = {"preflight": 0, "luna_schema": 0, "eod": 0}
+                for _ in range(args.preflight_runs): orchestrator.smoke_preflight(); passed["preflight"] += 1
+                for _ in range(args.luna_schema_runs): orchestrator.smoke_luna_schema(); passed["luna_schema"] += 1
+                for _ in range(args.eod_runs): orchestrator.smoke_eod(args.session); passed["eod"] += 1
+                if _production_snapshot(ROOT) != before:
+                    raise StateCorruptionError("Acceptance modified production state or reports")
+                counts = {"preflight": args.preflight_runs, "luna_schema": args.luna_schema_runs, "eod": args.eod_runs}
+                write_json_companion(ROOT / "state/reliability_acceptance.json", _acceptance_artifact(ROOT, counts))
+                result = {"status": "PASS", "gate": "RELIABILITY_LIVE_READ_ONLY",
+                    "preflight": {"passed": passed["preflight"], "requested": args.preflight_runs},
+                    "luna_schema": {"passed": passed["luna_schema"], "requested": args.luna_schema_runs},
+                    "eod": {"passed": passed["eod"], "requested": args.eod_runs},
+                    "production_state_modified": False, "write_tools_exposed": False}
+            elif args.smoke_stage_b_replay:
                 result = orchestrator.smoke_stage_b_replay(args.session)
             elif args.smoke_luna_schema:
                 result = orchestrator.smoke_luna_schema()
-            else:
+            elif args.smoke_eod:
                 result = orchestrator.smoke_eod(args.session)
+            else:
+                result = orchestrator.smoke_preflight()
             print(json.dumps(result, indent=2))
             return 0
         except (TraderError, OSError, ValueError) as exc:
@@ -1163,6 +1320,7 @@ def main(argv: list[str] | None = None) -> int:
         with lock:
             orchestrator = ShadowOrchestrator()
             if args.daemon:
+                verify_deployment_accepted(ROOT)
                 validation = validate_unattended_config(ROOT)
                 if validation["status"] != "PASS":
                     raise PreflightError("Unattended configuration invalid: " + "; ".join(validation["problems"]))

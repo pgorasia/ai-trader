@@ -250,9 +250,17 @@ class DaemonSupervisor:
         _audit("POST_CLOSE_RECOVERY", session=session.session_date)
         circuit_open = state.get("ai_circuit", {}).get("status") == "OPEN"
         has_operation_structure = bool(state.get("ai_operations"))
+        modern_preflight = state.get("version") is not None and isinstance(state.get("preflight_operations"), list)
+        failed_preflight = modern_preflight and any(
+            item.get("status") == "FAILED" for item in state.get("preflight_operations", [])
+            if isinstance(item, dict)
+        )
         if circuit_open:
             status = "SKIPPED_CIRCUIT_OPEN"
-        elif not has_operation_structure:
+        elif failed_preflight:
+            status = "PREFLIGHT_FAILED_FINALIZED"
+            state["post_close_recovery_state"] = status
+        elif not has_operation_structure and not modern_preflight:
             _audit("LEGACY_SESSION_DETECTED", session=session.session_date)
             status = "LEGACY_RECOVERY_FINALIZED"
             state["legacy_recovery_state"] = status
@@ -270,7 +278,9 @@ class DaemonSupervisor:
             state["post_close_recovery_state"] = status
         state["eod_review"] = {"session_date": session.session_date, "status": status,
                                "metrics_retained": True, "recovery_reason": "STARTED_AFTER_MARKET_CLOSE",
-                               "ai_eod_outcome": "FAILED_TERMINAL" if terminal_eod else "NOT_COMPLETED"}
+                               "ai_eod_outcome": ("FAILED_TERMINAL" if terminal_eod else
+                                                  "NOT_STARTED_PREFLIGHT_FAILED" if failed_preflight else
+                                                  "NOT_COMPLETED")}
         self.orchestrator.store.save(state)
         next_session = self.calendar.next_session(session.eod_time + timedelta(seconds=1))
         next_action = self._preflight_at(next_session)

@@ -106,6 +106,8 @@ class PostCloseRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); orchestrator, supervisor = self.supervisor(root)
             state = initial_state("2026-08-17")
+            state.pop("preflight_operations")
+            state.pop("ai_operations")
             orchestrator.store.save(state)
             stream = io.StringIO(); handler = logging.StreamHandler(stream)
             logger = logging.getLogger("ai_trader"); logger.addHandler(handler); logger.setLevel(logging.INFO)
@@ -127,6 +129,19 @@ class PostCloseRecoveryTests(unittest.TestCase):
                           "WAITING_FOR_NEXT_SESSION", "NEXT_ACTION"):
                 self.assertIn(event, log)
             self.assertNotIn("account", log.lower())
+
+    def test_current_session_failed_preflight_is_not_legacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); orchestrator, supervisor = self.supervisor(root)
+            state = initial_state("2026-08-17")
+            state["preflight_operations"].append({"operation_id": "preflight:test", "started_at": "2026-08-17T09:20:00-04:00", "completed_at": "2026-08-17T09:21:00-04:00", "status": "FAILED", "report_artifact": "reports/safe.json"})
+            state["operation_ids"].append("preflight:test")
+            orchestrator.store.save(state)
+            supervisor._recover_expired_session(at("2026-08-17T19:46:00-04:00"))
+            recovered = orchestrator.store.load("2026-08-17", create=False)
+            self.assertEqual(recovered["post_close_recovery_state"], "PREFLIGHT_FAILED_FINALIZED")
+            self.assertEqual(recovered["eod_review"]["ai_eod_outcome"], "NOT_STARTED_PREFLIGHT_FAILED")
+            self.assertNotIn("legacy_recovery_state", recovered)
 
     def test_circuit_open_recovery_is_deterministic(self):
         with tempfile.TemporaryDirectory() as directory:

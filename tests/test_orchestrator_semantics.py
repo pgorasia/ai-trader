@@ -39,6 +39,18 @@ class OrchestratorSemanticTests(unittest.TestCase):
         cycle = self.fixture("luna_candidate.json")
         self.core._validate_luna(cycle, initial_state("2026-08-14"), self.session, 0)
 
+    def test_luna_observed_counts_and_escalation_are_canonical(self):
+        cycle = self.fixture("luna_candidate.json")
+        cycle["tool_call_count"] = {"total": 999, "run_scan": 999}
+        cycle["sol_escalation"] = False
+        observed = {"get_accounts": 1, "get_equity_orders": 1, "get_equity_positions": 1,
+                    "run_scan": 1, "get_equity_quotes": 1, "get_equity_tradability": 1,
+                    "get_equity_historicals": 1, "get_equity_technical_indicators": 3}
+        self.core._validate_luna(cycle, initial_state("2026-08-14"), self.session, 0,
+                                 observed_tool_calls=observed)
+        self.assertEqual(cycle["tool_call_count"], {"total": 10, "run_scan": 1})
+        self.assertTrue(cycle["sol_escalation"])
+
     def test_cooldown_candidate_cannot_escalate_without_material_change(self):
         cycle = self.fixture("luna_candidate.json")
         cycle["finalists"][0]["classification"] = "COOLDOWN"
@@ -88,6 +100,16 @@ class OrchestratorSemanticTests(unittest.TestCase):
         decision = self.fixture("senior_no_trade.json")
         finalists = self.fixture("luna_candidate.json")["finalists"]
         self.core._validate_senior(decision, finalists, initial_state("2026-08-14"), self.session, 2)
+
+    def test_senior_observed_counts_are_canonical(self):
+        decision = self.fixture("senior_no_trade.json")
+        decision["web_search_count"] = 999; decision["robinhood_tool_call_count"] = 999
+        finalists = self.fixture("luna_candidate.json")["finalists"]
+        calls = {"get_equity_quotes": 1, "get_equity_historicals": 1}
+        self.core._validate_senior(decision, finalists, initial_state("2026-08-14"), self.session, 2,
+                                   observed_tool_calls=calls)
+        self.assertEqual(decision["web_search_count"], 2)
+        self.assertEqual(decision["robinhood_tool_call_count"], 2)
 
     def test_senior_shadow_plan_risk_and_time_gates(self):
         decision = self.fixture("senior_plan.json")
