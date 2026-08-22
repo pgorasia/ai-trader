@@ -1332,7 +1332,13 @@ def main(argv: list[str] | None = None) -> int:
         with lock:
             orchestrator = ShadowOrchestrator()
             if args.daemon:
-                verify_deployment_accepted(ROOT)
+                try:
+                    verify_deployment_accepted(ROOT)
+                except PreflightError as exc:
+                    if str(exc).startswith("DEPLOYMENT_NOT_ACCEPTED:"):
+                        print(f"FAIL CLOSED: {exc}", file=sys.stderr)
+                        return 42
+                    raise
                 validation = validate_unattended_config(ROOT)
                 if validation["status"] != "PASS":
                     raise PreflightError("Unattended configuration invalid: " + "; ".join(validation["problems"]))

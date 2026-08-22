@@ -14,6 +14,7 @@ ExecStartPre=/home/ubuntu/.venvs/ai-trader/bin/python -m trader.maintenance --re
 ExecStart=/home/ubuntu/.venvs/ai-trader/bin/python /home/ubuntu/projects/ai-trader/orchestrator.py --daemon
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
+RestartPreventExitStatus=42
 RestartSec=30s
 TimeoutStopSec=90s
 NoNewPrivileges=true
