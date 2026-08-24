@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-from .models import CodexRunError
+from .models import CodexRunError, ToolExecutionError
 
 
 KNOWN_NON_TOOL_EVENTS = frozenset({"thread.started", "turn.started", "turn.completed", "turn.failed", "error"})
@@ -146,7 +146,7 @@ def parse_codex_jsonl(stdout: str, *, returncode: int = 0, allow_nonzero: bool =
                     raise CodexRunError("Tool identity could not be resolved from its completed lifecycle")
                 status = item.get("status")
                 if status is not None and status != "completed":
-                    raise CodexRunError(f"Tool call did not complete successfully: {name}")
+                    raise ToolExecutionError(name, server, item_type)
                 normalized = name
                 if normalized.startswith(PROHIBITED_TOOL_PREFIXES):
                     raise CodexRunError(f"Observed prohibited tool activity: {normalized}")

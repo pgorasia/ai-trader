@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .codex_events import sanitize_diagnostic_text
-from .models import CodexRunError
+from .models import CodexRunError, DataUnavailableError, PreflightError, SchemaValidationError
 
 OPERATION_STATES = frozenset({"PENDING", "STARTED", "RETRY_WAIT", "COMPLETED", "FAILED_TERMINAL"})
 TRANSIENT = re.compile(r"rate.?limit|temporar(?:y|ily)|service unavailable|connection (?:reset|aborted)|http 50[23]", re.I)
@@ -81,16 +81,17 @@ def safe_failure_diagnostic(record: dict[str, Any], error: Exception, now: datet
         if isinstance(item, dict) and item.get("event") in {"tool.started", "tool.completed"} and isinstance(item.get("tool"), str):
             key = (item["tool"], "STARTED" if item["event"] == "tool.started" else "COMPLETED")
             lifecycle[key] = lifecycle.get(key, 0) + 1
+    default_code, default_stage = _application_failure_class(error)
     safe = {
         "operation_type": record["operation_type"], "operation_id": record["operation_id"],
         "scheduled_for": record["scheduled_for"], "started_at": record.get("started_at"),
         "completed_at": now.isoformat(), "attempt_number": record["attempt_number"],
         "max_attempts": record["max_attempts"], "exception_class": type(error).__name__,
         "sanitized_error": {
-            "code": structured.get("code", supplied.get("code", "NO_SAFE_STRUCTURED_CODE_AVAILABLE")),
+            "code": structured.get("code", supplied.get("code", default_code)),
             "message": sanitize_diagnostic_text(str(structured.get("message") or error)),
             "process_return_code": supplied.get("process_return_code"),
-            "stage_reached": supplied.get("stage_reached", "UNKNOWN"),
+            "stage_reached": supplied.get("stage_reached", default_stage),
         },
         "event_summary": {key: int(supplied.get(key, 0)) for key in
                           ("turn_started_count", "turn_completed_count", "turn_failed_count", "structured_error_count")},
@@ -105,6 +106,22 @@ def safe_failure_diagnostic(record: dict[str, Any], error: Exception, now: datet
         "decision": decision,
     }
     return safe
+
+
+def _application_failure_class(error: Exception) -> tuple[str, str]:
+    """Return bounded application-owned diagnostics without copying payload data."""
+    message = sanitize_diagnostic_text(str(error))
+    if isinstance(error, DataUnavailableError):
+        return "READ_ONLY_DATA_UNAVAILABLE", "TOOL_EXECUTION"
+    if isinstance(error, PreflightError):
+        return "PREFLIGHT_OR_SECURITY_FAILURE", "SEMANTIC_VALIDATION"
+    if isinstance(error, SchemaValidationError):
+        return "MODEL_SCHEMA_VALIDATION_FAILURE", "SCHEMA_VALIDATION"
+    if message.startswith("INVALID_MODEL_CONTENT:"):
+        return "INVALID_MODEL_CONTENT", "SEMANTIC_VALIDATION"
+    if isinstance(error, CodexRunError):
+        return "CODEX_RUN_FAILURE", "CODEX_EXECUTION"
+    return "APPLICATION_FAILURE", "APPLICATION"
 
 
 def fail(record: dict[str, Any], error: Exception, now: datetime,
@@ -132,6 +149,11 @@ def record_ai_failure(state: dict[str, Any], error: Exception, now: datetime,
                         "reason": "CONSECUTIVE_FAILURE_THRESHOLD" if circuit["consecutive_failures"] >= consecutive_threshold else "TOTAL_FAILURE_THRESHOLD"})
         return True
     return False
+
+
+def counts_toward_ai_circuit(error: Exception) -> bool:
+    """Data availability skips are operational failures, not AI integrity failures."""
+    return not isinstance(error, DataUnavailableError)
 
 
 def record_ai_success(state: dict[str, Any]) -> None:

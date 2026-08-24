@@ -14,9 +14,34 @@ from orchestrator import ROOT, ShadowOrchestrator, parser
 from trader.market_calendar import EquityMarketCalendar
 from trader.models import CodexRunResult, PreflightError, SchemaValidationError
 from trader.safety import load_config, validate_json
+from trader.state import initial_state
 
 
 class SmokeHarnessTests(unittest.TestCase):
+    @staticmethod
+    def historical_state():
+        """Self-contained sanitized replay evidence; never depend on production state."""
+        state = initial_state("2026-08-19")
+        cycle = json.loads((ROOT / "tests/fixtures/luna_candidate.json").read_text())
+        cycle.update({
+            "cycle_id": "2026-08-19-cycle-1",
+            "session_date": "2026-08-19",
+            "timestamp": "2026-08-19T14:50:05-04:00",
+            "scheduled_for": "2026-08-19T14:50:00-04:00",
+        })
+        calls = {
+            "get_accounts": 1, "get_equity_orders": 1, "get_equity_positions": 1,
+            "run_scan": 1, "get_equity_quotes": 1, "get_equity_tradability": 1,
+            "get_equity_historicals": 1, "get_equity_technical_indicators": 3,
+        }
+        cycle["tool_call_count"] = {"total": sum(calls.values()), "run_scan": 1}
+        cycle["cli_tool_calls"] = calls
+        cycle["cli_usage"] = {}
+        cycle["cli_diagnostics"] = {}
+        state["cycles"] = [cycle]
+        state["eod_completed"] = True
+        return state
+
     def bare(self, root: Path, runner=None) -> ShadowOrchestrator:
         core = ShadowOrchestrator.__new__(ShadowOrchestrator)
         core.root = root
@@ -28,12 +53,12 @@ class SmokeHarnessTests(unittest.TestCase):
     def stage_fixture(self, directory: str):
         root = Path(directory)
         (root / "state").mkdir(); (root / "schemas").mkdir()
-        shutil.copy2(ROOT / "state/2026-08-19.json", root / "state/2026-08-19.json")
+        (root / "state/2026-08-19.json").write_text(json.dumps(self.historical_state()), encoding="utf-8")
         shutil.copy2(ROOT / "schemas/luna-cycle.schema.json", root / "schemas/luna-cycle.schema.json")
         return root, self.bare(root)
 
     def replay_inputs(self):
-        state = json.loads((ROOT / "state/2026-08-19.json").read_text())
+        state = self.historical_state()
         source = next(item for item in state["cycles"] if item["scheduled_for"].startswith("2026-08-19T14:50:"))
         schema_path = ROOT / "schemas/luna-cycle.schema.json"
         schema = json.loads(schema_path.read_text())
@@ -87,7 +112,7 @@ class SmokeHarnessTests(unittest.TestCase):
 
     def test_luna_schema_uses_exact_schema_zero_mcp_and_preserves_production(self):
         schema = ROOT / "schemas/luna-cycle.schema.json"
-        minimal = json.loads((ROOT / "state/2026-08-19.json").read_text())["cycles"][0]
+        minimal = self.historical_state()["cycles"][0]
         required = json.loads(schema.read_text())["required"]
         minimal = {key: minimal[key] for key in required}
         fake = Mock()
@@ -128,29 +153,37 @@ class SmokeHarnessTests(unittest.TestCase):
         core.runner.run.assert_not_called()
 
     def test_eod_uses_production_pipeline_and_only_historicals(self):
-        state = json.loads((ROOT / "state/2026-08-19.json").read_text())
+        state = self.historical_state()
         review = self.eod_review(state)
         fake = Mock(); fake.run.return_value = CodexRunResult(data=review, tool_calls={"get_equity_historicals": 1})
-        core = self.bare(ROOT, fake)
-        reports_before = orchestrator._directory_snapshot(ROOT / "reports")
-        state_before = hashlib.sha256((ROOT / "state/2026-08-19.json").read_bytes()).hexdigest()
-        with patch("orchestrator._service_active", return_value=False):
-            result = core.smoke_eod("2026-08-19")
+        with tempfile.TemporaryDirectory() as directory:
+            smoke_root = Path(directory)
+            (smoke_root / "state").mkdir(); (smoke_root / "reports").mkdir()
+            (smoke_root / "prompts").symlink_to(ROOT / "prompts", target_is_directory=True)
+            (smoke_root / "schemas").symlink_to(ROOT / "schemas", target_is_directory=True)
+            (smoke_root / "methodology").symlink_to(ROOT / "methodology", target_is_directory=True)
+            state_path = smoke_root / "state/2026-08-19.json"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            core = self.bare(smoke_root, fake)
+            reports_before = orchestrator._directory_snapshot(smoke_root / "reports")
+            state_before = hashlib.sha256(state_path.read_bytes()).hexdigest()
+            with patch("orchestrator._service_active", return_value=False):
+                result = core.smoke_eod("2026-08-19")
+            self.assertEqual(state_before, hashlib.sha256(state_path.read_bytes()).hexdigest())
+            self.assertEqual(reports_before, orchestrator._directory_snapshot(smoke_root / "reports"))
         call = fake.run.call_args.kwargs
         self.assertEqual(call["robinhood_enabled_tools"], frozenset({"get_equity_historicals"}))
         self.assertEqual(call["required_robinhood_tools"], frozenset({"get_equity_historicals"}))
         self.assertNotIn("exact_robinhood_tools", call)
-        self.assertEqual(call["working_directory"], ROOT)
-        self.assertEqual(call["prompt_path"], ROOT / "prompts/eod-review.md")
-        self.assertEqual(call["schema_path"], ROOT / "schemas/eod-review.schema.json")
+        self.assertEqual(call["working_directory"], smoke_root)
+        self.assertEqual(call["prompt_path"], smoke_root / "prompts/eod-review.md")
+        self.assertEqual(call["schema_path"], smoke_root / "schemas/eod-review.schema.json")
         methodology = (ROOT / "methodology/eod-v1.md").read_bytes()
         self.assertEqual(call["context"]["eod_methodology"]["sha256"], hashlib.sha256(methodology).hexdigest())
         self.assertEqual(result["allowed_robinhood_tools"], ["get_equity_historicals"])
-        self.assertEqual(state_before, hashlib.sha256((ROOT / "state/2026-08-19.json").read_bytes()).hexdigest())
-        self.assertEqual(reports_before, orchestrator._directory_snapshot(ROOT / "reports"))
 
     def test_eod_semantic_validator_is_production_validator(self):
-        state = json.loads((ROOT / "state/2026-08-19.json").read_text())
+        state = self.historical_state()
         review = self.eod_review(state)
         core = self.bare(ROOT)
         core._validate_eod_review(review, state, 0)

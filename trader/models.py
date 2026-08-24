@@ -85,6 +85,20 @@ class CodexRunError(TraderError):
         self.diagnostics = diagnostics
 
 
+class ToolExecutionError(CodexRunError):
+    """A tool emitted a well-formed terminal event with a non-success status."""
+
+    def __init__(self, tool: str, server: str | None, item_type: str) -> None:
+        super().__init__(f"Tool call did not complete successfully: {tool}")
+        self.tool = tool
+        self.server = server
+        self.item_type = item_type
+
+
+class DataUnavailableError(CodexRunError):
+    """An approved read-only data call failed; the current operation is skipped."""
+
+
 class CodexTimeoutError(CodexRunError):
     pass
 

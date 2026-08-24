@@ -12,7 +12,7 @@ from typing import Any
 
 from .codex_events import CODEX_EVENT_PROTOCOL, parse_codex_jsonl, sanitize_diagnostic_text
 from .codex_executable import codex_child_environment, resolve_codex_executable
-from .models import CodexRunError, CodexRunResult, CodexTimeoutError
+from .models import CodexRunError, CodexRunResult, CodexTimeoutError, DataUnavailableError, ToolExecutionError
 from .shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, ShadowBoundaryResult, locate_codex_config, verify_shadow_mcp_boundary
 from .safety import normalize_codex_output, validate_json
 
@@ -168,6 +168,29 @@ class CodexRunner:
                     try:
                         parsed = parse_codex_jsonl(jsonl, returncode=completed.returncode, allow_nonzero=warning)
                     except CodexRunError as exc:
+                        if isinstance(exc, ToolExecutionError):
+                            expected_server = self._shadow_boundary.server_name.lower()
+                            approved_read_failure = (
+                                exc.item_type == "mcp_tool_call"
+                                and exc.server == expected_server
+                                and robinhood_enabled_tools is not None
+                                and exc.tool in robinhood_enabled_tools
+                                and exc.tool in APPROVED_SHADOW_ROBINHOOD_TOOLS
+                            )
+                            if approved_read_failure:
+                                diagnostics = {
+                                    "code": "READ_ONLY_TOOL_DATA_UNAVAILABLE",
+                                    "stage_reached": "TOOL_EXECUTION",
+                                    "observed_tool_summary": [{"name": exc.tool, "count": 1, "state": "FAILED"}],
+                                }
+                                self._last_run_diagnostics = {
+                                    "mcp_teardown_warning": False,
+                                    "diagnostic_codes": ["READ_ONLY_TOOL_DATA_UNAVAILABLE"],
+                                    "codex_failure_diagnostics": diagnostics,
+                                }
+                                raise DataUnavailableError(
+                                    f"Approved read-only data unavailable: {exc.tool}", diagnostics=diagnostics
+                                ) from exc
                         structured_message = ""
                         if exc.diagnostics is not None:
                             exc.diagnostics["teardown_classifier_reached"] = teardown_reached

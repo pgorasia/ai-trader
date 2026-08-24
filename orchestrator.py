@@ -38,7 +38,7 @@ from trader.automation import DaemonSupervisor, Heartbeat, health_check
 from trader.job_contracts import JOB_TOOL_CONTRACTS, validate_job_contracts
 from trader.operations import (complete as complete_operation, eligible as operation_eligible,
     ensure_controls, fail as fail_operation, operation as find_operation, prepare as prepare_operation,
-    record_ai_failure, record_ai_success, start as start_operation)
+    counts_toward_ai_circuit, record_ai_failure, record_ai_success, start as start_operation)
 from trader.shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, locate_codex_config, verify_shadow_mcp_boundary
 
 
@@ -145,9 +145,11 @@ class ShadowOrchestrator:
             if operation_type == "STAGE_B": counts["stage_b_failed_slots"] = counts.get("stage_b_failed_slots", 0) + 1
             diagnostics = self.runner.safe_diagnostics() if callable(getattr(self.runner, "safe_diagnostics", None)) else {}
             decision = fail_operation(record, exc, ended, diagnostics)
-            opened = record_ai_failure(state, exc, ended,
-                int(self.config.get("circuit_breaker", {}).get("consecutive_failures", 3)),
-                int(self.config.get("circuit_breaker", {}).get("total_failures", 5)))
+            opened = False
+            if counts_toward_ai_circuit(exc):
+                opened = record_ai_failure(state, exc, ended,
+                    int(self.config.get("circuit_breaker", {}).get("consecutive_failures", 3)),
+                    int(self.config.get("circuit_breaker", {}).get("total_failures", 5)))
             if opened:
                 counts["session_circuit_breaker_trips"] = counts.get("session_circuit_breaker_trips", 0) + 1
                 audit("SESSION_CIRCUIT_OPEN", failures=state["ai_circuit"]["failure_count"])
@@ -319,6 +321,7 @@ class ShadowOrchestrator:
             "scanner": self.config["scanner"],
             "cooldowns_and_prior_rejections": cooldown_context,
             "active_shadow_plan_count": self._active_plan_count(state),
+            "legal_completed_15m_bucket_starts": self._completed_15m_bucket_starts(session, luna_started),
         }
         def validate_stage_b(observed) -> None:
             cycle = observed.data
@@ -871,8 +874,6 @@ class ShadowOrchestrator:
     def _validate_luna(self, cycle: dict[str, Any], state: dict[str, Any], session, web_searches: int, *, expected_cycle_id: str | None = None, observed_tool_calls: dict[str, int] | None = None, observed_start: datetime | None = None, observed_end: datetime | None = None) -> None:
         if web_searches:
             raise SchemaValidationError("Luna used prohibited web search")
-        if cycle["errors"]:
-            raise CodexRunError("Luna returned data/tool errors")
         security = cycle["security_status"]
         account = cycle["account_status"]
         forbidden = {normalize_tool_name(name) for name in security["forbidden_tools_available"]} & FORBIDDEN_ROBINHOOD_TOOLS
@@ -904,6 +905,10 @@ class ShadowOrchestrator:
             raise SchemaValidationError("Luna scanner_total is inconsistent or insane")
         if len(cycle["symbols_processed"]) > int(self.config["scanner"]["maximum_results"]):
             raise SchemaValidationError("Luna exceeded the first-20 processing limit")
+        if cycle["errors"]:
+            if cycle["finalists"] or cycle["sol_escalation"]:
+                raise SchemaValidationError("Luna data-unavailable response cannot contain finalists or escalation")
+            return
         prior = state["cooldowns"]
         qualifying = False
         for finalist in cycle["finalists"]:
@@ -1024,6 +1029,17 @@ class ShadowOrchestrator:
             quote_time = aware(decision["quote_timestamp"]).astimezone(ET)
             if quote_time > decision_time or (decision_time - quote_time).total_seconds() > 60:
                 raise SchemaValidationError("Senior quote timestamp is stale or from the future")
+
+    @staticmethod
+    def _completed_15m_bucket_starts(session, as_of: datetime) -> list[str]:
+        """Exact legal bucket timestamps knowable before the Stage-B subprocess starts."""
+        cutoff = min(as_of.astimezone(ET), session.market_close)
+        starts: list[str] = []
+        cursor = session.market_open
+        while cursor + timedelta(minutes=15) <= cutoff:
+            starts.append(cursor.isoformat())
+            cursor += timedelta(minutes=15)
+        return starts
 
     @staticmethod
     def _validate_model_timestamp(value: str, observed_start: datetime | None, observed_end: datetime | None, label: str) -> None:
