@@ -6,6 +6,6 @@ Use read-only Robinhood regular-session 5-minute OHLCV through the close for eve
 
 For each senior-rejected symbol, evaluate only bars objectively subsequent to its decision timestamp. Classify as GOOD_AVOIDANCE, MISSED_LATER_SETUP, POSSIBLY_OVER_CONSERVATIVE, or INCONCLUSIVE. A later move does not make the original decision wrong; explicitly identify whether a materially new completed setup arose later. Report subsequent MFE/MAE as decimal percentages when supported. If 5-minute OHLCV cannot establish event ordering or a conclusion, return INCONCLUSIVE. Python will independently determine frozen-plan triggers, exits, P&L, running performance, and readiness from the returned bars and configured SHADOW reference capital. Real account equity, buying power, positions, orders, reservations, and fills are excluded from those calculations.
 
-Do not expose full account identifiers or any non-Agentic account information. Record all data failures in `errors`; do not fabricate or substitute.
+Do not expose full account identifiers or any non-Agentic account information. Record all approved historical-data failures in `errors`; do not fabricate or substitute. If `errors` is non-empty, return no decision reviews, null benchmark closes, and only any fully observed symbol bars; Python will classify the entire EOD attempt as data unavailable.
 
 Return `symbol_bars` as an array of objects with exactly `symbol` and `bars` fields; do not return a dynamic-key object map.

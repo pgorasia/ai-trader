@@ -161,9 +161,6 @@ class CodexRunner:
                 jsonl, stderr = self._split_ordered_output(ordered_output)
                 warning, teardown_count = self._recognized_teardown_lines(stderr)
                 teardown_reached = bool(stderr.strip())
-                if stderr.strip() and not warning:
-                    last_error = self._safe_error(stderr, jsonl)
-                    break
                 if jsonl.strip():
                     try:
                         parsed = parse_codex_jsonl(jsonl, returncode=completed.returncode, allow_nonzero=warning)
@@ -207,6 +204,9 @@ class CodexRunner:
                         raise
                 else:
                     parsed = None
+                if stderr.strip() and not warning:
+                    last_error = self._safe_error(stderr, jsonl)
+                    break
                 if completed.returncode == 0 or warning:
                     if parsed is None:
                         raise CodexRunError("Codex event stream was empty or truncated")

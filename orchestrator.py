@@ -27,7 +27,7 @@ from trader.codex_events import sanitize_diagnostic_text
 from trader.clock import SystemClock, TrustedClock
 from trader.instance_lock import SingleInstanceLock
 from trader.market_calendar import ET, EquityMarketCalendar
-from trader.models import CodexRunError, PreflightError, SchemaValidationError, ShadowPlanStatus, StateCorruptionError, TraderError
+from trader.models import CodexRunError, DataUnavailableError, PreflightError, SchemaValidationError, ShadowPlanStatus, StateCorruptionError, TraderError
 from trader.readiness import calculate_readiness
 from trader.reporting import cycle_markdown, eod_markdown, preflight_report_artifact, senior_markdown, write_json_companion, write_non_destructive_text
 from trader.safety import FORBIDDEN_ROBINHOOD_TOOLS, cooldown_until, derive_preflight_identity, enforce_preflight_result, enforce_preflight_stage, load_config, normalize_tool_name, offline_preflight, validate_json, write_alert
@@ -38,7 +38,7 @@ from trader.automation import DaemonSupervisor, Heartbeat, health_check
 from trader.job_contracts import JOB_TOOL_CONTRACTS, validate_job_contracts
 from trader.operations import (complete as complete_operation, eligible as operation_eligible,
     ensure_controls, fail as fail_operation, operation as find_operation, prepare as prepare_operation,
-    counts_toward_ai_circuit, record_ai_failure, record_ai_success, start as start_operation)
+    failure_counts_now, record_ai_failure, record_ai_success, start as start_operation)
 from trader.shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, locate_codex_config, verify_shadow_mcp_boundary
 
 
@@ -146,7 +146,7 @@ class ShadowOrchestrator:
             diagnostics = self.runner.safe_diagnostics() if callable(getattr(self.runner, "safe_diagnostics", None)) else {}
             decision = fail_operation(record, exc, ended, diagnostics)
             opened = False
-            if counts_toward_ai_circuit(exc):
+            if failure_counts_now(operation_type, decision, exc):
                 opened = record_ai_failure(state, exc, ended,
                     int(self.config.get("circuit_breaker", {}).get("consecutive_failures", 3)),
                     int(self.config.get("circuit_breaker", {}).get("total_failures", 5)))
@@ -599,7 +599,9 @@ class ShadowOrchestrator:
     def _validate_eod_review(self, review: dict[str, Any], state: dict[str, Any], web_searches: int) -> None:
         if web_searches:
             raise CodexRunError("EOD review observed prohibited tool activity")
-        if review["errors"] or review["session_date"] != state["session_date"]:
+        if review["errors"]:
+            raise DataUnavailableError("EOD approved read-only data unavailable")
+        if review["session_date"] != state["session_date"]:
             raise CodexRunError("EOD review failed data-integrity checks")
         if any(review["benchmark_closes"].get(symbol) is None for symbol in ("SPY", "QQQ")):
             raise CodexRunError("EOD review requires both SPY and QQQ benchmark closes")

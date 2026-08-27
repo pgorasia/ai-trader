@@ -68,7 +68,8 @@ def complete(record: dict[str, Any], now: datetime) -> None:
 def retry_eligible(error: Exception) -> bool:
     text = sanitize_diagnostic_text(str(error))
     return (isinstance(error, CodexRunError)
-            and bool(TRANSIENT.search(text) or EOD_CONTENT_FAILURE.fullmatch(text))
+            and bool(isinstance(error, DataUnavailableError)
+                     or TRANSIENT.search(text) or EOD_CONTENT_FAILURE.fullmatch(text))
             and not NONRETRYABLE.search(text))
 
 
@@ -154,6 +155,13 @@ def record_ai_failure(state: dict[str, Any], error: Exception, now: datetime,
 def counts_toward_ai_circuit(error: Exception) -> bool:
     """Data availability skips are operational failures, not AI integrity failures."""
     return not isinstance(error, DataUnavailableError)
+
+
+def failure_counts_now(operation_type: str, decision: str, error: Exception) -> bool:
+    """Count content failures once they are terminal, not while EOD owns a retry."""
+    return counts_toward_ai_circuit(error) and not (
+        operation_type == "EOD" and decision == "RETRY_AT"
+    )
 
 
 def record_ai_success(state: dict[str, Any]) -> None:
