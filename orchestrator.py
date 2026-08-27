@@ -27,7 +27,7 @@ from trader.codex_events import sanitize_diagnostic_text
 from trader.clock import SystemClock, TrustedClock
 from trader.instance_lock import SingleInstanceLock
 from trader.market_calendar import ET, EquityMarketCalendar
-from trader.models import CodexRunError, DataUnavailableError, PreflightError, SchemaValidationError, ShadowPlanStatus, StateCorruptionError, TraderError
+from trader.models import CodexRunError, DataUnavailableError, PreflightError, ResearchUnavailableError, SchemaValidationError, ShadowPlanStatus, StateCorruptionError, TraderError
 from trader.readiness import calculate_readiness
 from trader.reporting import cycle_markdown, eod_markdown, preflight_report_artifact, senior_markdown, write_json_companion, write_non_destructive_text
 from trader.safety import FORBIDDEN_ROBINHOOD_TOOLS, cooldown_until, derive_preflight_identity, enforce_preflight_result, enforce_preflight_stage, load_config, normalize_tool_name, offline_preflight, validate_json, write_alert
@@ -938,11 +938,14 @@ class ShadowOrchestrator:
                     raise SchemaValidationError("Material-requalification evidence cannot be from the future")
             previous_bar_time = None
             cycle_time = aware(cycle["timestamp"]).astimezone(ET)
+            legal_buckets = set(self._completed_15m_bucket_starts(session, observed_start or cycle_time))
             for bar in finalist["completed_15m_structure"]:
                 bar_time = aware(bar["timestamp"]).astimezone(ET)
                 offset_seconds = (bar_time - session.market_open).total_seconds()
                 if offset_seconds < 0 or offset_seconds % (15 * 60) != 0 or bar_time + timedelta(minutes=15) > min(cycle_time, session.market_close):
                     raise SchemaValidationError("Luna 15-minute structure contains a misaligned, forming, or out-of-session bar")
+                if bar_time.isoformat() not in legal_buckets:
+                    raise SchemaValidationError("Luna 15-minute structure timestamp is outside Python's supplied allowed set")
                 if previous_bar_time is not None and bar_time <= previous_bar_time:
                     raise SchemaValidationError("Luna 15-minute structure is not strictly chronological")
                 previous_bar_time = bar_time
@@ -966,7 +969,12 @@ class ShadowOrchestrator:
         if observed_tool_calls is not None:
             decision["robinhood_tool_call_count"] = sum(observed_tool_calls.values())
         if decision["errors"]:
-            raise CodexRunError("Sol returned data, MCP, OAuth, or required-research errors")
+            self._validate_senior_unavailable(decision, finalists, session, observed_start, observed_end)
+            code = decision["errors"][0]
+            diagnostics = {"code": code, "stage_reached": "RESEARCH_VALIDATION"}
+            if code == "READ_ONLY_TOOL_DATA_UNAVAILABLE":
+                raise DataUnavailableError("Sol approved read-only data unavailable", diagnostics=diagnostics)
+            raise ResearchUnavailableError("Sol required research unavailable", diagnostics=diagnostics)
         if web_searches <= 0:
             raise CodexRunError("Sol did not perform required targeted live catalyst research")
         self._validate_model_timestamp(decision["decision_timestamp"], observed_start, observed_end, "Sol")
@@ -1034,14 +1042,41 @@ class ShadowOrchestrator:
 
     @staticmethod
     def _completed_15m_bucket_starts(session, as_of: datetime) -> list[str]:
-        """Exact legal bucket timestamps knowable before the Stage-B subprocess starts."""
+        """Latest eight legal bucket timestamps knowable before Stage-B starts."""
         cutoff = min(as_of.astimezone(ET), session.market_close)
         starts: list[str] = []
         cursor = session.market_open
         while cursor + timedelta(minutes=15) <= cutoff:
             starts.append(cursor.isoformat())
             cursor += timedelta(minutes=15)
-        return starts
+        return starts[-8:]
+
+    def _validate_senior_unavailable(self, decision: dict[str, Any], finalists: list[dict[str, Any]], session,
+                                     observed_start: datetime | None, observed_end: datetime | None) -> None:
+        """Accept only the schema-bounded, fail-closed Sol availability no-op."""
+        allowed = {"REQUIRED_RESEARCH_UNAVAILABLE", "READ_ONLY_TOOL_DATA_UNAVAILABLE", "OAUTH_MCP_AVAILABILITY_FAILURE"}
+        if len(decision["errors"]) != 1 or decision["errors"][0] not in allowed:
+            raise SchemaValidationError("Sol returned an invalid availability diagnostic")
+        if decision["decision"] != "NO_TRADE":
+            raise SchemaValidationError("Sol availability failure cannot produce a plan")
+        expected = {item["symbol"] for item in finalists}
+        if set(decision["evaluated_symbols"]) != expected:
+            raise SchemaValidationError("Sol availability no-op must identify every supplied finalist")
+        if {item["symbol"] for item in decision["rejections"]} != expected:
+            raise SchemaValidationError("Sol availability no-op must reject every supplied finalist")
+        plan_fields = {
+            "symbol", "current_price", "quote_timestamp", "catalyst", "catalyst_classification",
+            "market_regime", "setup_type", "entry_trigger", "entry_trigger_type", "entry_condition",
+            "maximum_chase_price", "stop_price", "stop_basis", "target1", "target2_optional",
+            "hypothetical_notional", "hypothetical_quantity", "planned_dollar_risk",
+            "planned_account_risk_percent", "reward_risk_target1", "invalidation_condition",
+            "time_exit", "latest_entry_time", "mandatory_flat_time", "confidence",
+        }
+        if any(decision[field] is not None for field in plan_fields):
+            raise SchemaValidationError("Sol availability no-op contains plan content")
+        self._validate_model_timestamp(decision["decision_timestamp"], observed_start, observed_end, "Sol")
+        if aware(decision["decision_timestamp"]).astimezone(ET).date().isoformat() != session.session_date:
+            raise SchemaValidationError("Sol decision timestamp is outside the expected session date")
 
     @staticmethod
     def _validate_model_timestamp(value: str, observed_start: datetime | None, observed_end: datetime | None, label: str) -> None:

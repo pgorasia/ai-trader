@@ -99,6 +99,10 @@ class DataUnavailableError(CodexRunError):
     """An approved read-only data call failed; the current operation is skipped."""
 
 
+class ResearchUnavailableError(DataUnavailableError):
+    """Required senior research was unavailable; fail closed without blaming model content."""
+
+
 class CodexTimeoutError(CodexRunError):
     pass
 

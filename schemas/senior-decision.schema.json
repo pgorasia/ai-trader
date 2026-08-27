@@ -275,7 +275,12 @@
     "errors": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "enum": [
+          "REQUIRED_RESEARCH_UNAVAILABLE",
+          "READ_ONLY_TOOL_DATA_UNAVAILABLE",
+          "OAUTH_MCP_AVAILABILITY_FAILURE"
+        ]
       }
     }
   }

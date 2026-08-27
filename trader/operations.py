@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .codex_events import sanitize_diagnostic_text
-from .models import CodexRunError, DataUnavailableError, PreflightError, SchemaValidationError
+from .models import CodexRunError, DataUnavailableError, PreflightError, ResearchUnavailableError, SchemaValidationError
 
 OPERATION_STATES = frozenset({"PENDING", "STARTED", "RETRY_WAIT", "COMPLETED", "FAILED_TERMINAL"})
 TRANSIENT = re.compile(r"rate.?limit|temporar(?:y|ily)|service unavailable|connection (?:reset|aborted)|http 50[23]", re.I)
@@ -112,8 +112,12 @@ def safe_failure_diagnostic(record: dict[str, Any], error: Exception, now: datet
 def _application_failure_class(error: Exception) -> tuple[str, str]:
     """Return bounded application-owned diagnostics without copying payload data."""
     message = sanitize_diagnostic_text(str(error))
+    if isinstance(error, ResearchUnavailableError):
+        diagnostics = getattr(error, "diagnostics", None) or {}
+        return str(diagnostics.get("code", "REQUIRED_RESEARCH_UNAVAILABLE")), "RESEARCH_VALIDATION"
     if isinstance(error, DataUnavailableError):
-        return "READ_ONLY_DATA_UNAVAILABLE", "TOOL_EXECUTION"
+        diagnostics = getattr(error, "diagnostics", None) or {}
+        return str(diagnostics.get("code", "READ_ONLY_DATA_UNAVAILABLE")), "TOOL_EXECUTION"
     if isinstance(error, PreflightError):
         return "PREFLIGHT_OR_SECURITY_FAILURE", "SEMANTIC_VALIDATION"
     if isinstance(error, SchemaValidationError):
