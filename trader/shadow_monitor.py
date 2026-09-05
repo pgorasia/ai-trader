@@ -69,17 +69,38 @@ def validate_bar_series(bars: list[dict[str, Any]], *, session_date: str, as_of:
     return validated
 
 
-def aggregate_completed_15m(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def aggregate_completed_15m(
+    bars: list[dict[str, Any]], *, session_open: datetime | None = None,
+    session_close: datetime | None = None, as_of: datetime | None = None,
+    maximum: int = 8,
+) -> list[dict[str, Any]]:
+    """Build authoritative 15m bars without repairing invalid 5m source data."""
     groups: dict[datetime, list[dict[str, Any]]] = {}
+    invalid_anchors: set[datetime] = set()
     for bar in bars:
-        validate_bar(bar)
+        try:
+            timestamp = _dt(bar["timestamp"])
+        except (KeyError, TypeError, ValueError, SchemaValidationError):
+            continue
+        anchor = timestamp.replace(minute=(timestamp.minute // 15) * 15, second=0, microsecond=0)
+        try:
+            validate_bar(bar)
+        except (TypeError, ValueError, SchemaValidationError):
+            invalid_anchors.add(anchor)
+            continue
         if not bar.get("complete", False):
             continue
-        timestamp = _dt(bar["timestamp"])
-        anchor = timestamp.replace(minute=(timestamp.minute // 15) * 15, second=0, microsecond=0)
+        if session_open is not None and timestamp < session_open:
+            continue
+        if session_close is not None and timestamp + timedelta(minutes=5) > session_close:
+            continue
+        if as_of is not None and timestamp + timedelta(minutes=5) > as_of:
+            continue
         groups.setdefault(anchor, []).append(bar)
     aggregated: list[dict[str, Any]] = []
     for anchor, group in sorted(groups.items()):
+        if anchor in invalid_anchors:
+            continue
         ordered = sorted(group, key=lambda item: _dt(item["timestamp"]))
         expected = [anchor + timedelta(minutes=offset) for offset in (0, 5, 10)]
         if len(ordered) != 3 or [_dt(item["timestamp"]) for item in ordered] != expected:
@@ -93,7 +114,7 @@ def aggregate_completed_15m(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "volume": sum(float(item["volume"]) for item in ordered),
             "complete": True,
         })
-    return aggregated
+    return aggregated[-maximum:]
 
 
 class ShadowPlanMonitor:

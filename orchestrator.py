@@ -32,7 +32,7 @@ from trader.readiness import calculate_readiness
 from trader.reporting import cycle_markdown, eod_markdown, preflight_report_artifact, senior_markdown, write_json_companion, write_non_destructive_text
 from trader.safety import FORBIDDEN_ROBINHOOD_TOOLS, cooldown_until, derive_preflight_identity, enforce_preflight_result, enforce_preflight_stage, load_config, normalize_tool_name, offline_preflight, validate_json, write_alert
 from trader.scheduler import SessionScheduler
-from trader.shadow_monitor import ShadowPlanMonitor
+from trader.shadow_monitor import ShadowPlanMonitor, aggregate_completed_15m
 from trader.state import STRATEGY_VERSION, StateStore, initial_state
 from trader.automation import DaemonSupervisor, Heartbeat, health_check
 from trader.job_contracts import JOB_TOOL_CONTRACTS, validate_job_contracts
@@ -313,6 +313,7 @@ class ShadowOrchestrator:
         cycle_number = len(state["cycles"]) + 1
         cycle_id = f"{state['session_date']}-cycle-{cycle_number}"
         cooldown_context = self._cooldown_context(state, scheduled_for)
+        post_entry_locked = self._primary_entry_triggered(state)
         context = {
             "cycle_id": cycle_id,
             "scheduled_for": scheduled_for.isoformat(),
@@ -321,14 +322,15 @@ class ShadowOrchestrator:
             "scanner": self.config["scanner"],
             "cooldowns_and_prior_rejections": cooldown_context,
             "active_shadow_plan_count": self._active_plan_count(state),
-            "legal_completed_15m_bucket_starts": self._completed_15m_bucket_starts(session, luna_started),
+            "primary_entry_triggered": post_entry_locked,
         }
         def validate_stage_b(observed) -> None:
             cycle = observed.data
             cycle["tool_call_count"] = {"total": sum(observed.tool_calls.values()),
                                         "run_scan": observed.tool_calls.get("run_scan", 0)}
             ended = self._trusted_now()
-            cycle["sol_escalation"] = (ended < session.latest_entry and any(
+            self._derive_luna_15m(cycle, session, luna_started)
+            cycle["sol_escalation"] = (not post_entry_locked and ended < session.latest_entry and any(
                 item.get("classification") in {"NEW", "MATERIALLY_REQUALIFIED"}
                 for item in cycle.get("finalists", [])))
             try:
@@ -355,8 +357,9 @@ class ShadowOrchestrator:
             "total": sum(result.tool_calls.values()),
             "run_scan": result.tool_calls.get("run_scan", 0),
         }
+        self._derive_luna_15m(cycle, session, luna_started)
         cycle["sol_escalation"] = (
-            luna_ended < session.latest_entry
+            not post_entry_locked and luna_ended < session.latest_entry
             and any(item.get("classification") in {"NEW", "MATERIALLY_REQUALIFIED"}
                     for item in cycle.get("finalists", []))
         )
@@ -386,9 +389,48 @@ class ShadowOrchestrator:
                 self.store.save(state)
             else:
                 self.run_senior(state, session, cycle)
+        elif post_entry_locked:
+            self._record_post_entry_suppression(state, cycle_id, scheduled_for)
         return cycle
 
+    def _record_post_entry_suppression(self, state: dict[str, Any], cycle_id: str, scheduled_for: datetime) -> None:
+        operation_id = f"sol-skip-post-entry:{cycle_id}"
+        if operation_id not in state["operation_ids"]:
+            state["schedule_events"].append({
+                "operation_id": operation_id,
+                "status": "SKIPPED_PRIMARY_ENTRY_TRIGGERED",
+                "scheduled_for": scheduled_for.isoformat(),
+                "observed_at": self._trusted_now().isoformat(),
+            })
+            state["operation_ids"].append(operation_id)
+            self.store.save(state)
+
+    @staticmethod
+    def _primary_entry_triggered(state: dict[str, Any]) -> bool:
+        return any(
+            plan.get("research_role", "PRIMARY") == "PRIMARY"
+            and plan.get("outcome", {}).get("entry_triggered") is True
+            for plan in state["shadow_plans"]
+        )
+
+    @staticmethod
+    def _derive_luna_15m(cycle: dict[str, Any], session, as_of: datetime) -> None:
+        for finalist in cycle.get("finalists", []):
+            if "completed_5m_bars" not in finalist:
+                continue
+            source = finalist.pop("completed_5m_bars")
+            finalist["completed_15m_structure"] = aggregate_completed_15m(
+                source,
+                session_open=session.market_open,
+                session_close=session.market_close,
+                as_of=as_of,
+                maximum=8,
+            )
+
     def run_senior(self, state: dict[str, Any], session, cycle: dict[str, Any]) -> dict[str, Any]:
+        if self._primary_entry_triggered(state):
+            self._record_post_entry_suppression(state, cycle["cycle_id"], aware(cycle["timestamp"]))
+            return {"decision": "SUPPRESSED_PRIMARY_ENTRY_TRIGGERED"}
         finalists = [item for item in cycle["finalists"] if item["classification"] in {"NEW", "MATERIALLY_REQUALIFIED"}]
         if not finalists:
             raise SchemaValidationError("Sol escalation requested without a qualifying finalist")
@@ -874,6 +916,7 @@ class ShadowOrchestrator:
         }
 
     def _validate_luna(self, cycle: dict[str, Any], state: dict[str, Any], session, web_searches: int, *, expected_cycle_id: str | None = None, observed_tool_calls: dict[str, int] | None = None, observed_start: datetime | None = None, observed_end: datetime | None = None) -> None:
+        self._derive_luna_15m(cycle, session, observed_start or aware(cycle["timestamp"]))
         if web_searches:
             raise SchemaValidationError("Luna used prohibited web search")
         security = cycle["security_status"]
@@ -938,14 +981,11 @@ class ShadowOrchestrator:
                     raise SchemaValidationError("Material-requalification evidence cannot be from the future")
             previous_bar_time = None
             cycle_time = aware(cycle["timestamp"]).astimezone(ET)
-            legal_buckets = set(self._completed_15m_bucket_starts(session, observed_start or cycle_time))
             for bar in finalist["completed_15m_structure"]:
                 bar_time = aware(bar["timestamp"]).astimezone(ET)
                 offset_seconds = (bar_time - session.market_open).total_seconds()
                 if offset_seconds < 0 or offset_seconds % (15 * 60) != 0 or bar_time + timedelta(minutes=15) > min(cycle_time, session.market_close):
                     raise SchemaValidationError("Luna 15-minute structure contains a misaligned, forming, or out-of-session bar")
-                if bar_time.isoformat() not in legal_buckets:
-                    raise SchemaValidationError("Luna 15-minute structure timestamp is outside Python's supplied allowed set")
                 if previous_bar_time is not None and bar_time <= previous_bar_time:
                     raise SchemaValidationError("Luna 15-minute structure is not strictly chronological")
                 previous_bar_time = bar_time
@@ -960,7 +1000,11 @@ class ShadowOrchestrator:
             missing_evidence = sorted(name for name, minimum in evidence_minimums.items() if observed_tool_calls.get(name, 0) < minimum)
             if missing_evidence:
                 raise SchemaValidationError("Luna finalist lacks observed market-data evidence: " + ", ".join(missing_evidence))
-        cycle["sol_escalation"] = qualifying and aware(cycle["timestamp"]).astimezone(ET) < session.latest_entry
+        cycle["sol_escalation"] = (
+            not self._primary_entry_triggered(state)
+            and qualifying
+            and aware(cycle["timestamp"]).astimezone(ET) < session.latest_entry
+        )
         if aware(cycle["timestamp"]).astimezone(ET) >= session.latest_entry and cycle["sol_escalation"]:
             raise SchemaValidationError("Luna escalated after the latest-entry cutoff")
 

@@ -98,21 +98,10 @@ class Aug27ReliabilityTests(unittest.TestCase):
             self.assertEqual(state["ai_circuit"]["failure_count"], 0)
             self.assertEqual(state["shadow_plans"], [])
 
-    def test_python_supplies_latest_eight_and_only_allowed_buckets_validate(self):
+    def test_python_supplies_latest_eight_completed_buckets(self):
         starts = self.core._completed_15m_bucket_starts(self.session, datetime(2026, 8, 27, 12, 0, tzinfo=ET))
         self.assertEqual(len(starts), 8)
         self.assertEqual(starts[0], "2026-08-27T10:00:00-04:00")
-        cycle = self.fixture("luna_candidate.json")
-        cycle["timestamp"] = "2026-08-27T12:00:00-04:00"; cycle["session_date"] = "2026-08-27"
-        cycle["finalists"][0]["completed_15m_structure"] = [
-            {"timestamp": starts[0], "open": 10, "high": 11, "low": 9, "close": 10, "volume": 100, "complete": True}
-        ]
-        self.core._validate_luna(cycle, initial_state("2026-08-27"), self.session, 0,
-                                 observed_start=datetime(2026, 8, 27, 12, 0, tzinfo=ET))
-        cycle["finalists"][0]["completed_15m_structure"][0]["timestamp"] = "2026-08-27T09:45:00-04:00"
-        with self.assertRaisesRegex(SchemaValidationError, "allowed set"):
-            self.core._validate_luna(cycle, initial_state("2026-08-27"), self.session, 0,
-                                     observed_start=datetime(2026, 8, 27, 12, 0, tzinfo=ET))
 
     def test_schema_rejects_more_than_eight_even_when_older_buckets_are_complete(self):
         cycle = self.fixture("luna_candidate.json")

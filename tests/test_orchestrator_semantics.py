@@ -197,9 +197,11 @@ class OrchestratorSemanticTests(unittest.TestCase):
 
     def test_luna_rejects_misaligned_or_forming_15_minute_structure(self):
         cycle = self.fixture("luna_candidate.json")
-        cycle["finalists"][0]["completed_15m_structure"] = [{"timestamp": "2026-08-14T09:55:00-04:00", "open": 9.8, "high": 10.1, "low": 9.7, "close": 10.0, "volume": 1000, "complete": True}]
-        with self.assertRaisesRegex(SchemaValidationError, "15-minute"):
-            self.core._validate_luna(cycle, initial_state("2026-08-14"), self.session, 0)
+        cycle["finalists"][0]["completed_5m_bars"] = [
+            {"timestamp": "2026-08-14T09:55:00-04:00", "open": 9.8, "high": 10.1, "low": 9.7, "close": 10.0, "volume": 1000, "complete": True}
+        ]
+        self.core._validate_luna(cycle, initial_state("2026-08-14"), self.session, 0)
+        self.assertEqual(cycle["finalists"][0]["completed_15m_structure"], [])
 
     def test_senior_nonfinite_values_rejected(self):
         finalists = self.fixture("luna_candidate.json")["finalists"]

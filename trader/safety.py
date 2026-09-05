@@ -320,9 +320,8 @@ def _validate_removed_schema_invariants(data: dict[str, Any], schema_name: str) 
             _number(finalist["vwap"], "vwap", exclusive_minimum=0); _number(finalist["ema20"], "ema20", exclusive_minimum=0); _number(finalist["rsi14"], "rsi14", minimum=0, maximum=100)
             material = finalist["material_requalification"]
             if material is not None: _nonempty(material["evidence"], "evidence"); _aware_timestamp(material["evidence_timestamp"], "evidence_timestamp")
-            bars = finalist.get("completed_15m_structure", [])
-            if len(bars) > 8: raise SchemaValidationError("completed_15m_structure exceeds eight bars")
-            for bar_index, bar in enumerate(bars): _bar(bar, f"completed_15m_structure[{bar_index}]")
+            bars = finalist["completed_5m_bars"]
+            if len(bars) > 24: raise SchemaValidationError("completed_5m_bars exceeds 24 bars")
         _unique(data["security_status"]["forbidden_tools_available"], "forbidden_tools_available", normalize=normalize_tool_name)
         for key in ("agentic_account_count", "baseline_position_count", "baseline_external_order_count"):
             _number(data["account_status"][key], key, minimum=0)

@@ -20,7 +20,7 @@
     "volume_persistence": 1.7,
     "technical_reason": "Completed base breakout on persistent volume.",
     "material_requalification": null,
-    "completed_15m_structure": []
+    "completed_5m_bars": []
   }],
   "security_status": {"robinhood_mcp_available": true, "boundary_ok": true, "forbidden_tools_available": []},
   "account_status": {"agentic_account_count": 1, "reconciled": true, "baseline_position_count": 0, "baseline_external_order_count": 0, "baseline_external_orders_present": false, "baseline_external_orders": []},

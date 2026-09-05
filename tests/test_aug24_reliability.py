@@ -72,22 +72,11 @@ class Aug24ReliabilityRegressionTests(unittest.TestCase):
             "2026-08-14T09:45:00-04:00",
         ])
 
-    def test_impossible_ohlc_and_misaligned_or_forming_bars_remain_rejected(self):
-        impossible = self.fixture("luna_candidate.json")
-        impossible["finalists"][0]["completed_15m_structure"] = [{
-            "timestamp": "2026-08-14T09:30:00-04:00", "open": 10.0,
-            "high": 9.9, "low": 9.8, "close": 10.0, "volume": 100, "complete": True,
-        }]
-        with self.assertRaisesRegex(SchemaValidationError, "impossible OHLC"):
-            validate_json(impossible, ROOT / "schemas" / "luna-cycle.schema.json")
-        for timestamp in ("2026-08-14T09:55:00-04:00", "2026-08-14T10:00:00-04:00"):
-            cycle = self.fixture("luna_candidate.json")
-            cycle["finalists"][0]["completed_15m_structure"] = [{
-                "timestamp": timestamp, "open": 9.8, "high": 10.1,
-                "low": 9.7, "close": 10.0, "volume": 100, "complete": True,
-            }]
-            with self.subTest(timestamp=timestamp), self.assertRaisesRegex(SchemaValidationError, "15-minute"):
-                self.core._validate_luna(cycle, initial_state("2026-08-14"), self.session, 0)
+    def test_luna_schema_removes_model_owned_15_minute_structure(self):
+        cycle = self.fixture("luna_candidate.json")
+        cycle["finalists"][0]["completed_15m_structure"] = []
+        with self.assertRaisesRegex(SchemaValidationError, "Additional properties"):
+            validate_json(cycle, ROOT / "schemas" / "luna-cycle.schema.json")
 
     def test_invalid_sol_plan_timestamp_remains_rejected(self):
         decision = self.fixture("senior_plan.json")
@@ -153,8 +142,8 @@ class Aug24ReliabilityRegressionTests(unittest.TestCase):
     def test_prompt_contracts_keep_read_only_tools_and_exact_timestamp_rules(self):
         luna = (ROOT / "prompts/luna-stage-b.md").read_text(encoding="utf-8")
         sol = (ROOT / "prompts/sol-senior.md").read_text(encoding="utf-8")
-        self.assertIn("open=first.open", luna)
-        self.assertIn("legal_completed_15m_bucket_starts", luna)
+        self.assertIn("Python alone derives any 15-minute structure", luna)
+        self.assertNotIn("legal_completed_15m_bucket_starts", luna)
         self.assertIn("non-null timezone-aware ISO-8601", sol)
         self.assertFalse(any(name.startswith(("place_", "review_", "cancel_")) for name in APPROVED_SHADOW_ROBINHOOD_TOOLS))
 
