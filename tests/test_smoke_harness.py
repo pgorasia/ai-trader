@@ -6,13 +6,14 @@ import shutil
 import tempfile
 import unittest
 from copy import deepcopy
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import orchestrator
 from orchestrator import ROOT, ShadowOrchestrator, parser
 from trader.market_calendar import EquityMarketCalendar
-from trader.models import CodexRunResult, PreflightError, SchemaValidationError
+from trader.models import CodexRunError, CodexRunResult, PreflightError, SchemaValidationError
 from trader.safety import load_config, validate_json
 from trader.state import initial_state
 
@@ -110,27 +111,55 @@ class SmokeHarnessTests(unittest.TestCase):
             with self.subTest(missing=missing), self.assertRaises(SchemaValidationError):
                 core._validate_luna(damaged_cycle, state, session, 0, observed_tool_calls=damaged)
 
-    def test_luna_schema_uses_exact_schema_zero_mcp_and_preserves_production(self):
+    def luna_probe_result(self, *, calls=None, malformed=False):
+        cycle = json.loads((ROOT / "tests/fixtures/luna_candidate.json").read_text())
+        session = EquityMarketCalendar().session_for(date(2026, 8, 19))
+        start = session.market_open
+        cycle.update({"cycle_id": "luna-schema-live", "session_date": session.session_date,
+            "scanner": {"name": "historical-acceptance", "id": "historical-acceptance"},
+            "timestamp": session.market_close.isoformat(), "scanner_total": 1,
+            "symbols_processed": ["AAPL"], "errors": [], "sol_escalation": False})
+        finalist = cycle["finalists"][0]
+        finalist.update({"symbol": "AAPL", "classification": "NEW", "material_requalification": None})
+        finalist["completed_5m_bars"] = [
+            {"timestamp": (start + timedelta(minutes=offset)).isoformat(), "open": 10,
+             "high": 9 if malformed and offset == 0 else 11, "low": 9,
+             "close": 10, "volume": 100, "complete": True}
+            for offset in (0, 5, 10)]
+        return CodexRunResult(data=cycle,
+            tool_calls={"get_equity_historicals": 1} if calls is None else calls)
+
+    def test_luna_schema_live_probe_requires_history_and_preserves_production(self):
         schema = ROOT / "schemas/luna-cycle.schema.json"
-        minimal = self.historical_state()["cycles"][0]
-        required = json.loads(schema.read_text())["required"]
-        minimal = {key: minimal[key] for key in required}
         fake = Mock()
-        fake.run.return_value = CodexRunResult(data=minimal)
+        fake.run.return_value = self.luna_probe_result()
         core = self.bare(ROOT, fake)
         before = orchestrator._production_snapshot(ROOT)
-        result = core.smoke_luna_schema()
+        result = core.smoke_luna_schema("2026-08-19")
         self.assertTrue(result["model_invoked"])
+        self.assertEqual(result["historical_reads"], 1)
+        self.assertEqual(result["source_5m_bars"], 3)
+        self.assertEqual(result["derived_15m_bars"], 1)
         call = fake.run.call_args.kwargs
         self.assertEqual(call["schema_path"], schema)
-        self.assertTrue(call["disable_all_mcp"])
-        self.assertEqual(call["required_robinhood_tools"], frozenset())
-        self.assertNotIn("robinhood_enabled_tools", call)
+        self.assertEqual(call["required_robinhood_tools"], frozenset({"get_equity_historicals"}))
+        self.assertEqual(call["robinhood_enabled_tools"], frozenset({"get_equity_historicals"}))
         self.assertEqual(call["working_directory"], ROOT)
-        self.assertNotEqual(call["prompt_path"].parent, call["working_directory"])
-        prompt = call["prompt_path"].read_text(encoding="utf-8") if call["prompt_path"].exists() else ""
-        self.assertFalse(prompt, "temporary smoke prompt unexpectedly survived cleanup")
+        prompt = call["prompt_path"].read_text(encoding="utf-8")
+        self.assertIn("Make exactly one `get_equity_historicals` call", prompt)
+        self.assertIn("regular-session 5-minute OHLCV", prompt)
+        self.assertIn("Python can exercise deterministic 15-minute aggregation", prompt)
         self.assertEqual(before, orchestrator._production_snapshot(ROOT))
+
+    def test_luna_schema_live_probe_fails_without_observed_historical_call(self):
+        fake = Mock(); fake.run.return_value = self.luna_probe_result(calls={})
+        with self.assertRaisesRegex(CodexRunError, "exactly one historical read"):
+            self.bare(ROOT, fake).smoke_luna_schema("2026-08-19")
+
+    def test_luna_schema_live_probe_fails_closed_on_malformed_source_bars(self):
+        fake = Mock(); fake.run.return_value = self.luna_probe_result(malformed=True)
+        with self.assertRaisesRegex(SchemaValidationError, "Malformed OHLC"):
+            self.bare(ROOT, fake).smoke_luna_schema("2026-08-19")
 
     def test_runner_mcp_disabled_contract_has_no_servers_or_tools(self):
         runner = __import__("trader.codex_runner", fromlist=["CodexRunner"]).CodexRunner.__new__(__import__("trader.codex_runner", fromlist=["CodexRunner"]).CodexRunner)
@@ -192,7 +221,7 @@ class SmokeHarnessTests(unittest.TestCase):
 
     def test_all_smokes_refuse_non_shadow(self):
         altered = load_config(ROOT / "config/strategy.yaml"); altered["mode"] = "APPROVAL"
-        for command in (["--smoke-luna-schema"], ["--smoke-stage-b-replay", "--session", "2026-08-19"], ["--smoke-eod", "--session", "2026-08-19"]):
+        for command in (["--smoke-luna-schema", "--session", "2026-08-19"], ["--smoke-stage-b-replay", "--session", "2026-08-19"], ["--smoke-eod", "--session", "2026-08-19"]):
             with self.subTest(command=command), patch("orchestrator.load_config", return_value=altered), patch("orchestrator.ShadowOrchestrator") as constructor:
                 self.assertEqual(orchestrator.main(command), 2)
                 constructor.assert_not_called()

@@ -32,7 +32,7 @@ from trader.readiness import calculate_readiness
 from trader.reporting import cycle_markdown, eod_markdown, preflight_report_artifact, senior_markdown, write_json_companion, write_non_destructive_text
 from trader.safety import FORBIDDEN_ROBINHOOD_TOOLS, cooldown_until, derive_preflight_identity, enforce_preflight_result, enforce_preflight_stage, load_config, normalize_tool_name, offline_preflight, validate_json, write_alert
 from trader.scheduler import SessionScheduler
-from trader.shadow_monitor import ShadowPlanMonitor, aggregate_completed_15m
+from trader.shadow_monitor import ShadowPlanMonitor, aggregate_completed_15m, validate_bar_series
 from trader.state import STRATEGY_VERSION, StateStore, initial_state
 from trader.automation import DaemonSupervisor, Heartbeat, health_check
 from trader.job_contracts import JOB_TOOL_CONTRACTS, validate_job_contracts
@@ -838,35 +838,43 @@ class ShadowOrchestrator:
         return {"status": "PASS", "smoke": "PREFLIGHT_READ_ONLY", "stages": 4,
                 "production_state_modified": False, "write_tools_exposed": False}
 
-    def smoke_luna_schema(self) -> dict[str, Any]:
+    def smoke_luna_schema(self, session_date: str) -> dict[str, Any]:
         schema_path = self.root / "schemas" / "luna-cycle.schema.json"
-        minimal = {
-            "cycle_id": "schema-smoke", "session_date": "2026-01-02",
-            "scanner": {"name": "synthetic", "id": "synthetic"},
-            "timestamp": "2026-01-02T15:00:00Z", "scanner_total": 0,
-            "symbols_processed": [], "finalists": [],
-            "security_status": {"robinhood_mcp_available": False, "boundary_ok": True, "forbidden_tools_available": []},
-            "account_status": {"agentic_account_count": 0, "reconciled": False,
-                "baseline_position_count": 0, "baseline_external_order_count": 0,
-                "baseline_external_orders_present": False, "baseline_external_orders": []},
-            "tool_call_count": {"total": 0, "run_scan": 0}, "errors": [], "sol_escalation": False,
-        }
+        try:
+            day = datetime.strptime(session_date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise PreflightError("Luna schema smoke requires a valid historical session date") from exc
+        session = self.calendar.session_for(day)
+        if session is None:
+            raise PreflightError("Luna schema smoke session is not an exchange session")
         state_before = _production_snapshot(self.root)
-        with tempfile.TemporaryDirectory(prefix="ai-trader-luna-schema-") as directory:
-            temporary = Path(directory)
-            prompt = temporary / "prompt.md"
-            prompt.write_text(
-                "Do not read any file or call any tool. Return only this exact synthetic JSON object:\n"
-                + json.dumps(minimal, sort_keys=True), encoding="utf-8")
-            result = self.runner.run(prompt_path=prompt, schema_path=schema_path,
-                model=self.config["models"]["luna"], context={}, required_robinhood_tools=frozenset(),
-                allow_web=False, disable_all_mcp=True, working_directory=self.root)
-        if result.tool_calls or result.web_searches:
-            raise CodexRunError("Luna schema smoke observed prohibited tool activity")
+        result = self.runner.run(
+            prompt_path=self.root / "prompts" / "luna-schema-live.md",
+            schema_path=schema_path, model=self.config["models"]["luna"],
+            context={"probe_symbol": "AAPL", "session": self._session_context(session)},
+            required_robinhood_tools=frozenset({"get_equity_historicals"}),
+            robinhood_enabled_tools=frozenset({"get_equity_historicals"}),
+            allow_web=False, working_directory=self.root,
+        )
+        if result.tool_calls != {"get_equity_historicals": 1} or result.web_searches:
+            raise CodexRunError("Luna schema historical probe must observe exactly one historical read")
+        finalists = result.data.get("finalists", [])
+        if len(finalists) != 1 or finalists[0].get("symbol") != "AAPL":
+            raise SchemaValidationError("Luna schema historical probe did not return its required source-bar object")
+        source = finalists[0].get("completed_5m_bars")
+        if not isinstance(source, list) or not 3 <= len(source) <= 24:
+            raise SchemaValidationError("Luna schema historical probe requires 3-24 completed source 5-minute bars")
+        validate_bar_series(source, session_date=session.session_date,
+            as_of=session.market_close, mandatory_flat=session.market_close)
+        self._derive_luna_15m(result.data, session, session.market_close)
+        derived = finalists[0].get("completed_15m_structure")
+        if not derived:
+            raise SchemaValidationError("Luna schema historical probe source bars did not produce a completed deterministic 15-minute aggregate")
         if _production_snapshot(self.root) != state_before:
             raise StateCorruptionError("Luna schema smoke modified production state or reports")
         return {"status": "PASS", "smoke": "LUNA_SCHEMA", "model_invoked": True,
-                "robinhood_calls": 0, "production_state_modified": False}
+                "historical_reads": 1, "source_5m_bars": len(source),
+                "derived_15m_bars": len(derived), "production_state_modified": False}
 
     def smoke_eod(self, session_date: str) -> dict[str, Any]:
         if _service_active("ai-trader.service"):
@@ -1360,7 +1368,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
-    session_smoke = args.smoke_stage_b_replay or args.smoke_eod or args.reliability_acceptance_live
+    session_smoke = args.smoke_stage_b_replay or args.smoke_luna_schema or args.smoke_eod or args.reliability_acceptance_live
     if session_smoke and not args.session:
         argument_parser.error("--session is required for this smoke/acceptance command")
     if args.session and not session_smoke:
@@ -1399,7 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
                 before = _production_snapshot(ROOT)
                 passed = {"preflight": 0, "luna_schema": 0, "eod": 0}
                 for _ in range(args.preflight_runs): orchestrator.smoke_preflight(); passed["preflight"] += 1
-                for _ in range(args.luna_schema_runs): orchestrator.smoke_luna_schema(); passed["luna_schema"] += 1
+                for _ in range(args.luna_schema_runs): orchestrator.smoke_luna_schema(args.session); passed["luna_schema"] += 1
                 for _ in range(args.eod_runs): orchestrator.smoke_eod(args.session); passed["eod"] += 1
                 if _production_snapshot(ROOT) != before:
                     raise StateCorruptionError("Acceptance modified production state or reports")
@@ -1413,7 +1421,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.smoke_stage_b_replay:
                 result = orchestrator.smoke_stage_b_replay(args.session)
             elif args.smoke_luna_schema:
-                result = orchestrator.smoke_luna_schema()
+                result = orchestrator.smoke_luna_schema(args.session)
             elif args.smoke_eod:
                 result = orchestrator.smoke_eod(args.session)
             else:

@@ -64,6 +64,11 @@ class Sep1ReliabilityTests(unittest.TestCase):
         before = deepcopy(state["ai_circuit"])
         with patch("orchestrator.write_non_destructive_text"), patch("orchestrator.write_json_companion"):
             returned = core.run_luna_cycle(state, self.session, now)
+        stage_b_call = core._run_ai_job.call_args.kwargs
+        self.assertEqual(stage_b_call["required_robinhood_tools"], frozenset({
+            "get_accounts", "get_equity_orders", "get_equity_positions", "run_scan",
+        }))
+        self.assertIn("get_equity_historicals", stage_b_call["robinhood_enabled_tools"])
         core.run_senior.assert_not_called()
         self.assertFalse(returned["sol_escalation"])
         self.assertEqual(state["ai_circuit"], before)
