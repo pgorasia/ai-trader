@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Live SHADOW acceptance portfolio probe",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["account_equity", "buying_power", "portfolio_status"],
+  "properties": {
+    "account_equity": {"type": ["number", "null"]},
+    "buying_power": {"type": ["number", "null"]},
+    "portfolio_status": {"type": "string"}
+  }
+}

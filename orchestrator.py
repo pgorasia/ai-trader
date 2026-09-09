@@ -870,9 +870,9 @@ class ShadowOrchestrator:
             raise PreflightError("Live acceptance did not establish an Agentic account context")
         selected_classification = identity_data["selected_account_classification"]
         stages = (
-            ("portfolio", "get_portfolio", "preflight-acceptance-portfolio.md", "preflight-portfolio.schema.json"),
-            ("positions", "get_equity_positions", "preflight-acceptance-positions.md", "preflight-positions.schema.json"),
-            ("orders", "get_equity_orders", "preflight-acceptance-orders.md", "preflight-orders.schema.json"),
+            ("portfolio", "get_portfolio", "preflight-acceptance-portfolio.md", "preflight-acceptance-portfolio.schema.json"),
+            ("positions", "get_equity_positions", "preflight-acceptance-positions.md", "preflight-acceptance-positions.schema.json"),
+            ("orders", "get_equity_orders", "preflight-acceptance-orders.md", "preflight-acceptance-orders.schema.json"),
         )
         observed = {"identity": dict(identity.tool_calls)}
         for stage, tool, prompt, schema in stages:
@@ -887,10 +887,6 @@ class ShadowOrchestrator:
                 expected_robinhood_arguments={tool: {"account_number": account_number}},
                 exact_robinhood_tools=True, allow_web=False,
             )
-            derive_preflight_identity(child.data)
-            if child.data["selected_account_classification"] != selected_classification:
-                raise PreflightError("Safe Agentic account classification changed during live acceptance")
-            enforce_preflight_stage(stage, child.data)
             observed[stage] = dict(child.tool_calls)
         if _production_snapshot(self.root) != before:
             raise StateCorruptionError("Preflight acceptance modified production state or reports")

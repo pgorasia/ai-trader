@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Live SHADOW acceptance positions probe",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["baseline_position_count", "baseline_positions_present", "baseline_positions"],
+  "properties": {
+    "baseline_position_count": {"type": "integer"},
+    "baseline_positions_present": {"type": "boolean"},
+    "baseline_positions": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["symbol", "quantity"], "properties": {"symbol": {"type": "string"}, "quantity": {"type": "number"}}}}
+  }
+}

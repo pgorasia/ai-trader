@@ -173,16 +173,13 @@ class SmokeHarnessTests(unittest.TestCase):
             if tool == "get_accounts":
                 data = deepcopy(identity_data)
             elif tool == "get_portfolio":
-                data = {"passed": True, "account_classifications": [account], "errors": [],
-                        "account_reconciled": True, "account_equity": 100.0,
+                data = {"account_equity": 100.0,
                         "buying_power": 100.0, "portfolio_status": "active"}
             elif tool == "get_equity_positions":
-                data = {"passed": True, "account_classifications": [account], "errors": [],
-                        "account_reconciled": True, "baseline_position_count": 0,
+                data = {"baseline_position_count": 0,
                         "baseline_positions_present": False, "baseline_positions": []}
             else:
-                data = {"passed": True, "account_classifications": [account], "errors": [],
-                        "account_reconciled": True, "relevant_order_count": 0,
+                data = {"relevant_order_count": 0,
                         "open_pending_count": 0, "baseline_external_order_count": 0,
                         "baseline_external_orders_present": False, "baseline_external_orders": []}
             return CodexRunResult(data=data, tool_calls={tool: 1})
@@ -202,6 +199,14 @@ class SmokeHarnessTests(unittest.TestCase):
         self.assertTrue(all(call["required_robinhood_tools"] == call["robinhood_enabled_tools"] for call in calls))
         self.assertNotIn("selected_account_number", calls[0]["context"])
         self.assertTrue(all(call["context"]["selected_account_number"] == "EPHEMERAL-ACCOUNT" for call in calls[1:]))
+        self.assertEqual([call["schema_path"].name for call in calls[1:]], [
+            "preflight-acceptance-portfolio.schema.json",
+            "preflight-acceptance-positions.schema.json",
+            "preflight-acceptance-orders.schema.json",
+        ])
+        for call in calls[1:]:
+            properties = json.loads(call["schema_path"].read_text())["properties"]
+            self.assertFalse({"passed", "errors", "account_reconciled", "account_classifications"} & set(properties))
         self.assertTrue(all(call["expected_robinhood_arguments"] == {
             next(iter(call["required_robinhood_tools"])): {"account_number": "EPHEMERAL-ACCOUNT"}
         } for call in calls[1:]))

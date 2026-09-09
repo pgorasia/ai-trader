@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Live SHADOW acceptance orders probe",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["relevant_order_count", "open_pending_count", "baseline_external_order_count", "baseline_external_orders_present", "baseline_external_orders"],
+  "properties": {
+    "relevant_order_count": {"type": "integer"},
+    "open_pending_count": {"type": "integer"},
+    "baseline_external_order_count": {"type": "integer"},
+    "baseline_external_orders_present": {"type": "boolean"},
+    "baseline_external_orders": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["symbol", "state", "side"], "properties": {"symbol": {"type": "string"}, "state": {"type": "string"}, "side": {"type": "string"}}}}
+  }
+}

@@ -61,6 +61,9 @@ REQUIRED_PROJECT_FILES = (
     "schemas/preflight-portfolio.schema.json",
     "schemas/preflight-positions.schema.json",
     "schemas/preflight-orders.schema.json",
+    "schemas/preflight-acceptance-portfolio.schema.json",
+    "schemas/preflight-acceptance-positions.schema.json",
+    "schemas/preflight-acceptance-orders.schema.json",
     "schemas/shadow-monitor.schema.json",
 )
 
@@ -303,6 +306,20 @@ def _validate_removed_schema_invariants(data: dict[str, Any], schema_name: str) 
             for index, item in enumerate(data["baseline_external_orders"]): _symbol(item["symbol"], f"baseline_external_orders[{index}].symbol")
             if data["baseline_external_order_count"] != len(data["baseline_external_orders"]): raise SchemaValidationError("Baseline external order count does not match details")
             if data["baseline_external_orders_present"] != bool(data["baseline_external_orders"]): raise SchemaValidationError("Baseline external order presence does not match details")
+    elif schema_name == "preflight-acceptance-portfolio.schema.json":
+        for key in ("account_equity", "buying_power"):
+            if data[key] is not None: _number(data[key], key, minimum=0)
+        _nonempty(data["portfolio_status"], "portfolio_status")
+    elif schema_name == "preflight-acceptance-positions.schema.json":
+        _number(data["baseline_position_count"], "baseline_position_count", minimum=0)
+        for index, item in enumerate(data["baseline_positions"]): _symbol(item["symbol"], f"baseline_positions[{index}].symbol"); _number(item["quantity"], "quantity", exclusive_minimum=0)
+        if data["baseline_position_count"] != len(data["baseline_positions"]): raise SchemaValidationError("Baseline position count does not match details")
+        if data["baseline_positions_present"] != bool(data["baseline_positions"]): raise SchemaValidationError("Baseline position presence does not match details")
+    elif schema_name == "preflight-acceptance-orders.schema.json":
+        for key in ("relevant_order_count", "open_pending_count", "baseline_external_order_count"): _number(data[key], key, minimum=0)
+        for index, item in enumerate(data["baseline_external_orders"]): _symbol(item["symbol"], f"baseline_external_orders[{index}].symbol")
+        if data["baseline_external_order_count"] != len(data["baseline_external_orders"]): raise SchemaValidationError("Baseline external order count does not match details")
+        if data["baseline_external_orders_present"] != bool(data["baseline_external_orders"]): raise SchemaValidationError("Baseline external order presence does not match details")
     elif schema_name == "historical-probe.schema.json":
         _symbol(data["probe_symbol"], "probe_symbol"); _date(data["session_date"], "session_date")
         if len(data["source_5m_bars"]) > 24: raise SchemaValidationError("Historical probe source_5m_bars exceeds 24 bars")
