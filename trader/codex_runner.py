@@ -313,6 +313,12 @@ class CodexRunner:
 
     @staticmethod
     def _validate_preflight_tool_order(events: list[dict[str, Any]], server_name: str, required_tools: frozenset[str]) -> None:
+        # This validator can prove account-first ordering only within a run whose
+        # exact contract includes both identity and account-scoped reads.  Some
+        # acceptance probes intentionally expose a single leaf tool only after
+        # Python has completed and validated a separate identity run.
+        if "get_accounts" not in required_tools:
+            return
         accounts_completed = False
         scoped = required_tools - {"get_accounts"}
         started: dict[str, tuple[str, str]] = {}

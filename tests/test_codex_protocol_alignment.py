@@ -207,6 +207,30 @@ class CodexProtocolAlignmentTests(unittest.TestCase):
     def test_generic_nonzero_run_fails(self):
         self.assert_job_fails(lifecycle(), returncode=7)
 
+    def test_scoped_only_exact_run_does_not_require_same_process_identity(self):
+        events = [
+            {"type": "thread.started"}, {"type": "turn.started"},
+            {"type": "item.started", "item": {"id": "m1", "type": "mcp_tool_call",
+             "server": "robinhood-trading", "tool": "get_portfolio"}},
+            {"type": "item.completed", "item": {"id": "m1", "type": "mcp_tool_call"}},
+            {"type": "turn.completed"},
+        ]
+        CodexRunner._validate_preflight_tool_order(
+            events, "robinhood-trading", frozenset({"get_portfolio"})
+        )
+
+    def test_combined_preflight_still_rejects_scoped_start_before_identity_completion(self):
+        events = [
+            {"type": "item.started", "item": {"id": "a", "type": "mcp_tool_call",
+             "server": "robinhood-trading", "tool": "get_accounts"}},
+            {"type": "item.started", "item": {"id": "p", "type": "mcp_tool_call",
+             "server": "robinhood-trading", "tool": "get_portfolio"}},
+        ]
+        with self.assertRaisesRegex(CodexRunError, "get_accounts must complete"):
+            CodexRunner._validate_preflight_tool_order(
+                events, "robinhood-trading", frozenset({"get_accounts", "get_portfolio"})
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
