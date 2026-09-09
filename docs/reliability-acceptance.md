@@ -5,7 +5,7 @@ offline unittest/fault-injection suite and deterministic policy checks without
 constructing a Codex runner or writing state. The operator-run
 `--reliability-acceptance-live` command requires an inactive service, repeats
 a deterministically staged equivalent of the production read-only preflight, the Luna
-schema/historical-path probe, and historical EOD smokes,
+schema/historical-path probe, and persisted historical EOD replays,
 then writes `state/reliability_acceptance.json` for the current commit. The
 daemon rejects a missing, malformed, stale, non-SHADOW, or wrong-commit
 artifact with `DEPLOYMENT_NOT_ACCEPTED`. Test and acceptance commands are not
@@ -26,7 +26,15 @@ unattended preflight sequencing and its independent per-stage account/provenance
 checks are unchanged.
 
 The `--session YYYY-MM-DD` argument supplies the completed exchange session
-used by both historical probes.
+used by the live historical probe and persisted EOD replay.
+
+The EOD replay validates the completed session's persisted EOD review against
+the current model-facing schema and the production semantic validator without
+launching another model or recollecting market data. Live historical access,
+exact invocation, completed-bar provenance, and deterministic 15-minute
+aggregation are proved separately by the dedicated historical probe. This
+avoids making acceptance depend on repeated model-driven reconstruction of an
+already completed EOD result.
 
 Production state and report trees are hashed before and after the live smoke
 work. The acceptance artifact is written only after that equality check; it

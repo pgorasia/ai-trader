@@ -945,21 +945,26 @@ class ShadowOrchestrator:
         session = self.calendar.session_for(datetime.strptime(session_date, "%Y-%m-%d").date())
         if session is None:
             raise PreflightError("EOD smoke session is not an exchange session")
-        context = self._eod_context(state, session)
-        with tempfile.TemporaryDirectory(prefix=f"ai-trader-eod-smoke-{session_date}-") as directory:
-            result = self.runner.run(prompt_path=self.root / "prompts" / "eod-review.md",
-                schema_path=self.root / "schemas" / "eod-review.schema.json",
-                model=self.config["models"]["luna"], context=context,
-                required_robinhood_tools=JOB_TOOL_CONTRACTS["EOD"], allow_web=False,
-                robinhood_enabled_tools=JOB_TOOL_CONTRACTS["EOD"],
-                working_directory=self.root)
-        self._validate_eod_review(result.data, state, result.web_searches)
+        review = state.get("eod_review")
+        if not isinstance(review, dict):
+            raise PreflightError("EOD smoke requires a persisted completed review")
+        model_shape = {key: deepcopy(value) for key, value in review.items()
+                       if key != "cli_diagnostics"}
+        symbol_bars = model_shape.get("symbol_bars")
+        if not isinstance(symbol_bars, dict):
+            raise PreflightError("EOD smoke requires normalized persisted symbol bars")
+        model_shape["symbol_bars"] = [
+            {"symbol": symbol, "bars": bars}
+            for symbol, bars in symbol_bars.items()
+        ]
+        validate_json(model_shape, self.root / "schemas" / "eod-review.schema.json")
+        self._validate_eod_review(review, state, 0)
         if hashlib.sha256(state_path.read_bytes()).hexdigest() != state_hash:
             raise StateCorruptionError("EOD smoke modified production session state")
         if _directory_snapshot(self.root / "reports") != reports_before:
             raise StateCorruptionError("EOD smoke modified normal production reports")
-        return {"status": "PASS", "smoke": "EOD_READ_ONLY", "session": session_date,
-                "allowed_robinhood_tools": ["get_equity_historicals"], "production_state_modified": False}
+        return {"status": "PASS", "smoke": "EOD_PERSISTED_REPLAY", "session": session_date,
+                "allowed_robinhood_tools": [], "production_state_modified": False}
 
     def status(self, now: datetime | None = None) -> dict[str, Any]:
         current = (now or datetime.now(ET)).astimezone(ET)

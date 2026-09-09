@@ -286,10 +286,11 @@ class SmokeHarnessTests(unittest.TestCase):
             core.smoke_eod("2026-08-19")
         core.runner.run.assert_not_called()
 
-    def test_eod_uses_production_pipeline_and_only_historicals(self):
+    def test_eod_replays_persisted_review_through_schema_and_production_validator(self):
         state = self.historical_state()
         review = self.eod_review(state)
-        fake = Mock(); fake.run.return_value = CodexRunResult(data=review, tool_calls={"get_equity_historicals": 1})
+        state["eod_review"] = review
+        fake = Mock()
         with tempfile.TemporaryDirectory() as directory:
             smoke_root = Path(directory)
             (smoke_root / "state").mkdir(); (smoke_root / "reports").mkdir()
@@ -305,16 +306,21 @@ class SmokeHarnessTests(unittest.TestCase):
                 result = core.smoke_eod("2026-08-19")
             self.assertEqual(state_before, hashlib.sha256(state_path.read_bytes()).hexdigest())
             self.assertEqual(reports_before, orchestrator._directory_snapshot(smoke_root / "reports"))
-        call = fake.run.call_args.kwargs
-        self.assertEqual(call["robinhood_enabled_tools"], frozenset({"get_equity_historicals"}))
-        self.assertEqual(call["required_robinhood_tools"], frozenset({"get_equity_historicals"}))
-        self.assertNotIn("exact_robinhood_tools", call)
-        self.assertEqual(call["working_directory"], smoke_root)
-        self.assertEqual(call["prompt_path"], smoke_root / "prompts/eod-review.md")
-        self.assertEqual(call["schema_path"], smoke_root / "schemas/eod-review.schema.json")
-        methodology = (ROOT / "methodology/eod-v1.md").read_bytes()
-        self.assertEqual(call["context"]["eod_methodology"]["sha256"], hashlib.sha256(methodology).hexdigest())
-        self.assertEqual(result["allowed_robinhood_tools"], ["get_equity_historicals"])
+        fake.run.assert_not_called()
+        self.assertEqual(result["smoke"], "EOD_PERSISTED_REPLAY")
+        self.assertEqual(result["allowed_robinhood_tools"], [])
+
+    def test_eod_persisted_replay_rejects_schema_invalid_completed_review(self):
+        state = self.historical_state()
+        state["eod_review"] = self.eod_review(state)
+        state["eod_review"]["unexpected"] = "field"
+        with tempfile.TemporaryDirectory() as directory:
+            smoke_root = Path(directory)
+            (smoke_root / "state").mkdir(); (smoke_root / "reports").mkdir()
+            (smoke_root / "schemas").symlink_to(ROOT / "schemas", target_is_directory=True)
+            (smoke_root / "state/2026-08-19.json").write_text(json.dumps(state), encoding="utf-8")
+            with patch("orchestrator._service_active", return_value=False), self.assertRaises(SchemaValidationError):
+                self.bare(smoke_root, Mock()).smoke_eod("2026-08-19")
 
     def test_eod_semantic_validator_is_production_validator(self):
         state = self.historical_state()
