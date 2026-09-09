@@ -1,0 +1,3 @@
+Perform the orders stage of the live SHADOW acceptance preflight. Python has already completed and validated `get_accounts`; only `get_equity_orders` is available. Call `get_equity_orders` exactly once with the `selected_account_number` supplied in deterministic context and wait for completion. Do not call or attempt `get_accounts`.
+
+Copy `selected_account_classification` from deterministic context as the sole `account_classifications` item. Treat returned orders as external account activity and return only the schema's symbol/state/side summaries. Never return the account number, identifiers, order IDs, URLs, raw responses, tokens, or credentials. No other tool, web, scanning, or writes.

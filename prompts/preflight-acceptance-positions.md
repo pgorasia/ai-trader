@@ -1,0 +1,3 @@
+Perform the positions stage of the live SHADOW acceptance preflight. Python has already completed and validated `get_accounts`; only `get_equity_positions` is available. Call `get_equity_positions` exactly once with the `selected_account_number` supplied in deterministic context and wait for completion. Do not call or attempt `get_accounts`.
+
+Copy `selected_account_classification` from deterministic context as the sole `account_classifications` item. Treat returned holdings as passive external baseline positions and return only the schema's symbol/quantity summaries. Never return the account number, identifiers, URLs, raw responses, tokens, or credentials. No other tool, web, scanning, or writes.

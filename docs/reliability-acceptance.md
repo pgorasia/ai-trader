@@ -4,11 +4,20 @@ The reliability gate has two parts. `--reliability-acceptance-offline` runs the
 offline unittest/fault-injection suite and deterministic policy checks without
 constructing a Codex runner or writing state. The operator-run
 `--reliability-acceptance-live` command requires an inactive service, repeats
-the production read-only preflight, Luna schema/historical-path probe, and historical EOD smokes,
+a deterministically staged equivalent of the production read-only preflight, the Luna
+schema/historical-path probe, and historical EOD smokes,
 then writes `state/reliability_acceptance.json` for the current commit. The
 daemon rejects a missing, malformed, stale, non-SHADOW, or wrong-commit
 artifact with `DEPLOYMENT_NOT_ACCEPTED`. Test and acceptance commands are not
 gated, preventing a circular dependency.
+
+The live acceptance preflight first exposes only `get_accounts`. Python applies
+the production identity and account-sanity rules before any account-scoped run
+is launched. Portfolio, position, and order stages then each expose exactly one
+approved read tool and use the ephemeral established account context. The
+identifier is never included in reports or the acceptance artifact. Production
+unattended preflight sequencing and its independent per-stage account/provenance
+checks are unchanged.
 
 The `--session YYYY-MM-DD` argument supplies the completed exchange session
 used by both historical probes.

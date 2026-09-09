@@ -16,6 +16,7 @@ from trader.market_calendar import EquityMarketCalendar
 from trader.models import CodexRunError, CodexRunResult, PreflightError, SchemaValidationError
 from trader.safety import load_config, validate_json
 from trader.state import initial_state
+from trader.shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS
 
 
 class SmokeHarnessTests(unittest.TestCase):
@@ -154,6 +155,85 @@ class SmokeHarnessTests(unittest.TestCase):
         fake = Mock(); fake.run.return_value = self.luna_probe_result(calls={})
         with self.assertRaisesRegex(CodexRunError, "exactly one historical read"):
             self.bare(ROOT, fake).smoke_luna_schema("2026-08-19")
+
+    def acceptance_runner(self, *, identity=None, failure_tool=None):
+        runner = Mock()
+        account = {"agentic_allowed": True, "brokerage_account_type": "individual",
+                   "management_type": "self_directed", "state": "active",
+                   "deactivated": False, "permanently_deactivated": False}
+        identity_data = {"passed": True, "account_contexts": [
+            {"account_number": "EPHEMERAL-ACCOUNT", **account}], "errors": []}
+        if identity is not None:
+            identity_data = identity
+
+        def run(**kwargs):
+            tool = next(iter(kwargs["required_robinhood_tools"]))
+            if tool == failure_tool:
+                raise CodexRunError(f"{tool} failed")
+            if tool == "get_accounts":
+                data = deepcopy(identity_data)
+            elif tool == "get_portfolio":
+                data = {"passed": True, "account_classifications": [account], "errors": [],
+                        "account_reconciled": True, "account_equity": 100.0,
+                        "buying_power": 100.0, "portfolio_status": "active"}
+            elif tool == "get_equity_positions":
+                data = {"passed": True, "account_classifications": [account], "errors": [],
+                        "account_reconciled": True, "baseline_position_count": 0,
+                        "baseline_positions_present": False, "baseline_positions": []}
+            else:
+                data = {"passed": True, "account_classifications": [account], "errors": [],
+                        "account_reconciled": True, "relevant_order_count": 0,
+                        "open_pending_count": 0, "baseline_external_order_count": 0,
+                        "baseline_external_orders_present": False, "baseline_external_orders": []}
+            return CodexRunResult(data=data, tool_calls={tool: 1})
+        runner.run.side_effect = run
+        return runner
+
+    def test_live_acceptance_preflight_is_deterministically_account_first(self):
+        runner = self.acceptance_runner(); core = self.bare(ROOT, runner)
+        core.boundary = Mock(policy_version="shadow-robinhood-readonly-v1")
+        with patch("orchestrator._service_active", return_value=False):
+            result = core.smoke_preflight_acceptance()
+        self.assertEqual(result["status"], "PASS")
+        calls = [call.kwargs for call in runner.run.call_args_list]
+        self.assertEqual([call["required_robinhood_tools"] for call in calls], [
+            frozenset({"get_accounts"}), frozenset({"get_portfolio"}),
+            frozenset({"get_equity_positions"}), frozenset({"get_equity_orders"})])
+        self.assertTrue(all(call["required_robinhood_tools"] == call["robinhood_enabled_tools"] for call in calls))
+        self.assertNotIn("selected_account_number", calls[0]["context"])
+        self.assertTrue(all(call["context"]["selected_account_number"] == "EPHEMERAL-ACCOUNT" for call in calls[1:]))
+        self.assertNotIn("EPHEMERAL-ACCOUNT", json.dumps(result))
+
+    def test_live_acceptance_missing_or_failed_accounts_stops_scoped_calls(self):
+        account = {"agentic_allowed": False, "brokerage_account_type": "individual",
+                   "management_type": "self_directed", "state": "active",
+                   "deactivated": False, "permanently_deactivated": False}
+        missing = self.acceptance_runner(identity={"passed": False, "account_contexts": [
+            {"account_number": "", **account}], "errors": ["missing"]})
+        failed = self.acceptance_runner(failure_tool="get_accounts")
+        for runner in (missing, failed):
+            core = self.bare(ROOT, runner); core.boundary = Mock(policy_version="policy")
+            with self.subTest(runner=runner), patch("orchestrator._service_active", return_value=False), self.assertRaises((PreflightError, CodexRunError)):
+                core.smoke_preflight_acceptance()
+            self.assertEqual(runner.run.call_count, 1)
+
+    def test_live_acceptance_scoped_failure_fails_closed_without_later_calls(self):
+        runner = self.acceptance_runner(failure_tool="get_portfolio")
+        core = self.bare(ROOT, runner); core.boundary = Mock(policy_version="policy")
+        with patch("orchestrator._service_active", return_value=False), self.assertRaises(CodexRunError):
+            core.smoke_preflight_acceptance()
+        self.assertEqual(runner.run.call_count, 2)
+
+    def test_live_acceptance_exposes_only_four_approved_reads(self):
+        runner = self.acceptance_runner(); core = self.bare(ROOT, runner)
+        core.boundary = Mock(policy_version="policy")
+        with patch("orchestrator._service_active", return_value=False): core.smoke_preflight_acceptance()
+        exposed = set().union(*(call.kwargs["robinhood_enabled_tools"] for call in runner.run.call_args_list))
+        self.assertEqual(exposed, {"get_accounts", "get_portfolio", "get_equity_positions", "get_equity_orders"})
+        self.assertTrue(exposed <= APPROVED_SHADOW_ROBINHOOD_TOOLS)
+        self.assertEqual(len(APPROVED_SHADOW_ROBINHOOD_TOOLS), 22)
+        self.assertFalse([name for name in APPROVED_SHADOW_ROBINHOOD_TOOLS if name.startswith(
+            ("place_", "cancel_", "review_", "create_", "update_", "delete_", "submit_", "modify_"))])
 
     def test_luna_schema_live_probe_fails_closed_on_malformed_source_bars(self):
         fake = Mock(); fake.run.return_value = self.luna_probe_result(malformed=True)

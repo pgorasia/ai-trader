@@ -1,0 +1,3 @@
+Perform the first, account-identity stage of the live SHADOW acceptance preflight. Call `get_accounts` exactly once and wait for it to complete. No other Robinhood tool is available or permitted.
+
+Return one `account_contexts` item per returned account, preserving response order, with exactly the six classification fields plus that same account's `account_number`. Copy native values and do not select an account or calculate identity counts. Python independently derives identity, applies the account-sanity rules, and selects the associated account number. Do not return balances, positions, orders, URLs, raw responses, tokens, or credentials. Account numbers are ephemeral acceptance context and must appear nowhere else in the result. No web, scanning, or writes.

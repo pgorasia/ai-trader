@@ -838,6 +838,65 @@ class ShadowOrchestrator:
         return {"status": "PASS", "smoke": "PREFLIGHT_READ_ONLY", "stages": 4,
                 "production_state_modified": False, "write_tools_exposed": False}
 
+    def smoke_preflight_acceptance(self) -> dict[str, Any]:
+        """Exercise preflight reads with deterministic account-first exposure."""
+        if _service_active("ai-trader.service"):
+            raise PreflightError("Preflight acceptance refused because ai-trader.service is active")
+        before = _production_snapshot(self.root)
+        common = {"mode": "SHADOW", "deterministic_boundary_policy": self.boundary.policy_version}
+        identity = self.runner.run(
+            prompt_path=self.root / "prompts/preflight-acceptance-identity.md",
+            schema_path=self.root / "schemas/preflight-acceptance-identity.schema.json",
+            model=self.config["models"]["luna"], context=common,
+            required_robinhood_tools=frozenset({"get_accounts"}),
+            robinhood_enabled_tools=frozenset({"get_accounts"}),
+            exact_robinhood_tools=True, allow_web=False,
+        )
+        identity_data = identity.data
+        contexts = identity_data.get("account_contexts")
+        if not isinstance(contexts, list):
+            raise PreflightError("Live acceptance account context is missing")
+        identity_data["account_classifications"] = [
+            {key: item.get(key) for key in ("agentic_allowed", "brokerage_account_type",
+             "management_type", "state", "deactivated", "permanently_deactivated")}
+            for item in contexts if isinstance(item, dict)
+        ]
+        derive_preflight_identity(identity_data)
+        enforce_preflight_stage("identity", identity_data)
+        selected_indexes = [index for index, item in enumerate(identity_data["account_classifications"])
+                            if item.get("agentic_allowed") is True]
+        account_number = contexts[selected_indexes[0]].get("account_number") if len(selected_indexes) == 1 else None
+        if not isinstance(account_number, str) or not account_number.strip():
+            raise PreflightError("Live acceptance did not establish an Agentic account context")
+        selected_classification = identity_data["selected_account_classification"]
+        stages = (
+            ("portfolio", "get_portfolio", "preflight-acceptance-portfolio.md", "preflight-portfolio.schema.json"),
+            ("positions", "get_equity_positions", "preflight-acceptance-positions.md", "preflight-positions.schema.json"),
+            ("orders", "get_equity_orders", "preflight-acceptance-orders.md", "preflight-orders.schema.json"),
+        )
+        observed = {"identity": dict(identity.tool_calls)}
+        for stage, tool, prompt, schema in stages:
+            child = self.runner.run(
+                prompt_path=self.root / "prompts" / prompt,
+                schema_path=self.root / "schemas" / schema,
+                model=self.config["models"]["luna"],
+                context={**common, "selected_account_number": account_number,
+                         "selected_account_classification": selected_classification},
+                required_robinhood_tools=frozenset({tool}),
+                robinhood_enabled_tools=frozenset({tool}),
+                exact_robinhood_tools=True, allow_web=False,
+            )
+            derive_preflight_identity(child.data)
+            if child.data["selected_account_classification"] != selected_classification:
+                raise PreflightError("Safe Agentic account classification changed during live acceptance")
+            enforce_preflight_stage(stage, child.data)
+            observed[stage] = dict(child.tool_calls)
+        if _production_snapshot(self.root) != before:
+            raise StateCorruptionError("Preflight acceptance modified production state or reports")
+        return {"status": "PASS", "smoke": "PREFLIGHT_ACCEPTANCE_STAGED", "stages": 4,
+                "observed_calls": observed, "production_state_modified": False,
+                "write_tools_exposed": False}
+
     def smoke_luna_schema(self, session_date: str) -> dict[str, Any]:
         schema_path = self.root / "schemas" / "historical-probe.schema.json"
         try:
@@ -1407,7 +1466,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise PreflightError("Offline reliability gate did not pass")
                 before = _production_snapshot(ROOT)
                 passed = {"preflight": 0, "luna_schema": 0, "eod": 0}
-                for _ in range(args.preflight_runs): orchestrator.smoke_preflight(); passed["preflight"] += 1
+                for _ in range(args.preflight_runs): orchestrator.smoke_preflight_acceptance(); passed["preflight"] += 1
                 for _ in range(args.luna_schema_runs): orchestrator.smoke_luna_schema(args.session); passed["luna_schema"] += 1
                 for _ in range(args.eod_runs): orchestrator.smoke_eod(args.session); passed["eod"] += 1
                 if _production_snapshot(ROOT) != before:
