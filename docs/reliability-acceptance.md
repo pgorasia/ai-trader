@@ -14,7 +14,9 @@ gated, preventing a circular dependency.
 The live acceptance preflight first exposes only `get_accounts`. Python applies
 the production identity and account-sanity rules before any account-scoped run
 is launched. Portfolio, position, and order stages then each expose exactly one
-approved read tool and use the ephemeral established account context. The
+approved read tool and use the ephemeral established account context. Python
+also verifies that each scoped call's sole `account_number` argument exactly
+matches the value associated with the validated Agentic classification. The
 identifier is never included in reports or the acceptance artifact. Production
 unattended preflight sequencing and its independent per-stage account/provenance
 checks are unchanged.

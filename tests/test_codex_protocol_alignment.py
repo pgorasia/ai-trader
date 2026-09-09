@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -230,6 +231,33 @@ class CodexProtocolAlignmentTests(unittest.TestCase):
             CodexRunner._validate_preflight_tool_order(
                 events, "robinhood-trading", frozenset({"get_accounts", "get_portfolio"})
             )
+
+    def test_exact_argument_provenance_accepts_only_the_python_value(self):
+        events = [{"type": "item.started", "item": {"id": "p", "type": "mcp_tool_call",
+                   "server": "robinhood-trading", "tool": "get_portfolio",
+                   "arguments": {"account_number": "EPHEMERAL"}}}]
+        CodexRunner._validate_robinhood_arguments(
+            events, "robinhood-trading",
+            {"get_portfolio": {"account_number": "EPHEMERAL"}},
+        )
+        for arguments in ({}, {"selected_account_number": "EPHEMERAL"},
+                          {"account_number": "CHANGED"}):
+            changed = deepcopy(events)
+            changed[0]["item"]["arguments"] = arguments
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(
+                    CodexRunError, "deterministic Python context"):
+                CodexRunner._validate_robinhood_arguments(
+                    changed, "robinhood-trading",
+                    {"get_portfolio": {"account_number": "EPHEMERAL"}},
+                )
+
+    def test_argument_provenance_error_does_not_disclose_expected_value(self):
+        with self.assertRaises(CodexRunError) as caught:
+            CodexRunner._validate_robinhood_arguments(
+                [], "robinhood-trading",
+                {"get_portfolio": {"account_number": "PRIVATE-ACCOUNT"}},
+            )
+        self.assertNotIn("PRIVATE-ACCOUNT", str(caught.exception))
 
 
 if __name__ == "__main__":

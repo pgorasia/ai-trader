@@ -202,6 +202,9 @@ class SmokeHarnessTests(unittest.TestCase):
         self.assertTrue(all(call["required_robinhood_tools"] == call["robinhood_enabled_tools"] for call in calls))
         self.assertNotIn("selected_account_number", calls[0]["context"])
         self.assertTrue(all(call["context"]["selected_account_number"] == "EPHEMERAL-ACCOUNT" for call in calls[1:]))
+        self.assertTrue(all(call["expected_robinhood_arguments"] == {
+            next(iter(call["required_robinhood_tools"])): {"account_number": "EPHEMERAL-ACCOUNT"}
+        } for call in calls[1:]))
         self.assertNotIn("EPHEMERAL-ACCOUNT", json.dumps(result))
 
     def test_live_acceptance_missing_or_failed_accounts_stops_scoped_calls(self):

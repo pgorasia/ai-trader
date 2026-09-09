@@ -884,6 +884,7 @@ class ShadowOrchestrator:
                          "selected_account_classification": selected_classification},
                 required_robinhood_tools=frozenset({tool}),
                 robinhood_enabled_tools=frozenset({tool}),
+                expected_robinhood_arguments={tool: {"account_number": account_number}},
                 exact_robinhood_tools=True, allow_web=False,
             )
             derive_preflight_identity(child.data)
