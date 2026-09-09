@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from trader.codex_events import parse_codex_jsonl
 from trader.codex_runner import CodexRunner
-from trader.models import CodexRunError
+from trader.models import CodexRunError, DataUnavailableError
 from trader.operations import retry_eligible
 from trader.shadow_boundary import ShadowBoundaryResult
 
@@ -166,6 +166,35 @@ class CodexFailureDiagnosticsTests(unittest.TestCase):
         self.assertEqual(caught.exception.diagnostics["observed_tool_summary"], [
             {"name": "robinhood-trading::get_accounts", "count": 1},
         ])
+
+    def test_failed_read_preserves_safe_lifecycle_and_terminal_metadata(self):
+        stream = line(
+            {"type": "thread.started", "thread_id": "opaque"},
+            {"type": "turn.started"},
+            {"type": "item.started", "item": {"id": "one", "type": "mcp_tool_call", "server": "robinhood-trading", "tool": "get_accounts", "arguments": {"account_number": "SECRET"}}},
+            {"type": "item.completed", "item": {"id": "one", "type": "mcp_tool_call", "server": "robinhood-trading", "tool": "get_accounts", "status": "completed", "result": {"private": "SECRET"}}},
+            {"type": "item.started", "item": {"id": "two", "type": "mcp_tool_call", "server": "robinhood-trading", "tool": "get_equity_historicals", "arguments": {"token": "SECRET"}}},
+            {"type": "item.completed", "item": {"id": "two", "type": "mcp_tool_call", "server": "robinhood-trading", "tool": "get_equity_historicals", "status": "failed", "error": {"message": "HTTP 503 session_id=SECRET", "code": "temporarily_unavailable"}, "result": {"private": "SECRET"}}},
+        )
+        runner = self.bare_runner()
+        runner.project_root = ROOT; runner.executable = "codex"; runner.child_environment = {}
+        runner.timeout_seconds = 10; runner.transient_retries = 0; runner.retry_backoff = 0; runner.version = "test"
+        runner._shadow_boundary = ShadowBoundaryResult(Path("/tmp/config.toml"), "robinhood-trading", frozenset({"get_accounts", "get_equity_historicals"}))
+        completed = subprocess.CompletedProcess([], 0, stdout=stream, stderr="")
+        with patch("trader.codex_runner.subprocess.run", return_value=completed):
+            with self.assertRaises(DataUnavailableError) as caught:
+                runner.run(prompt_path=ROOT / "prompts/preflight.md", schema_path=ROOT / "schemas/preflight.schema.json", model="test", context={}, required_robinhood_tools=frozenset(), robinhood_enabled_tools=frozenset({"get_accounts", "get_equity_historicals"}))
+        diagnostics = caught.exception.diagnostics
+        self.assertEqual(diagnostics["process_return_code"], 0)
+        self.assertEqual(diagnostics["observed_tool_summary"], [
+            {"name": "get_accounts", "count": 1, "state": "COMPLETED"},
+            {"name": "get_equity_historicals", "count": 1, "state": "FAILED"},
+        ])
+        self.assertEqual(diagnostics["tool_terminal_error"]["code"], "temporarily_unavailable")
+        self.assertIn("session_id=<redacted>", diagnostics["tool_terminal_error"]["message"])
+        encoded = json.dumps(diagnostics)
+        self.assertNotIn('"arguments"', encoded); self.assertNotIn('"result"', encoded)
+        self.assertNotIn("SECRET", encoded)
 
 
 if __name__ == "__main__":

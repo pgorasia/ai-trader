@@ -146,7 +146,8 @@ def parse_codex_jsonl(stdout: str, *, returncode: int = 0, allow_nonzero: bool =
                     raise CodexRunError("Tool identity could not be resolved from its completed lifecycle")
                 status = item.get("status")
                 if status is not None and status != "completed":
-                    raise ToolExecutionError(name, server, item_type)
+                    diagnostics["tool_terminal_error"] = _sanitize_tool_terminal_error(item, status)
+                    raise ToolExecutionError(name, server, item_type, diagnostics=diagnostics)
                 normalized = name
                 if normalized.startswith(PROHIBITED_TOOL_PREFIXES):
                     raise CodexRunError(f"Observed prohibited tool activity: {normalized}")
@@ -219,6 +220,8 @@ def _failure_diagnostics(events: list[dict[str, Any]], returncode: int) -> dict[
                         "tool": _normalize_metadata(tool),
                         "item_id": _safe_item_id(item_id),
                     }
+                    if event_type == "item.completed" and item.get("status") not in (None, "completed"):
+                        entry["terminal_status"] = _normalize_metadata(str(item.get("status")))
                     if tool in expected:
                         if event_type == "item.completed":
                             expected[tool] = "COMPLETED" if item.get("status") in (None, "completed") else "FAILED"
@@ -276,6 +279,24 @@ def _sanitize_structured_error(event: dict[str, Any]) -> dict[str, Any]:
     message = result.get("message")
     if isinstance(message, str) and _CODEX_USAGE_LIMIT.search(message):
         result["code"] = "CODEX_USAGE_LIMIT"
+    return result
+
+
+def _sanitize_tool_terminal_error(item: dict[str, Any], status: Any) -> dict[str, Any]:
+    """Keep bounded failure metadata, never MCP arguments or result payloads."""
+    result: dict[str, Any] = {"status": _normalize_metadata(str(status))}
+    error = item.get("error") if isinstance(item.get("error"), dict) else {}
+    fields = (
+        ("message", error.get("message", item.get("message"))),
+        ("http_status", error.get("httpStatusCode", item.get("httpStatusCode"))),
+        ("code", error.get("code", item.get("code"))),
+        ("name", error.get("name", item.get("error_type"))),
+    )
+    for key, value in fields:
+        if isinstance(value, str) and value:
+            result[key] = _sanitize_text(value)
+        elif key == "http_status" and isinstance(value, int) and not isinstance(value, bool):
+            result[key] = value
     return result
 
 

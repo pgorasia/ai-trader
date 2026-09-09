@@ -101,6 +101,7 @@ def safe_failure_diagnostic(record: dict[str, Any], error: Exception, now: datet
         "observed_tool_summary": supplied.get("observed_tool_summary", []),
         "foreign_mcp": supplied.get("foreign_mcp", []),
         "missing_required_tools": supplied.get("missing_required_tools", []),
+        "tool_terminal_error": supplied.get("tool_terminal_error"),
         "teardown_classifier": {"reached": bool(supplied.get("teardown_classifier_reached", False)),
                                 "result": supplied.get("teardown_classifier_result"),
                                 "diagnostic_code": supplied.get("teardown_diagnostic_code")},

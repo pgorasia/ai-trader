@@ -88,8 +88,9 @@ class CodexRunError(TraderError):
 class ToolExecutionError(CodexRunError):
     """A tool emitted a well-formed terminal event with a non-success status."""
 
-    def __init__(self, tool: str, server: str | None, item_type: str) -> None:
-        super().__init__(f"Tool call did not complete successfully: {tool}")
+    def __init__(self, tool: str, server: str | None, item_type: str,
+                 *, diagnostics: dict[str, Any] | None = None) -> None:
+        super().__init__(f"Tool call did not complete successfully: {tool}", diagnostics=diagnostics)
         self.tool = tool
         self.server = server
         self.item_type = item_type

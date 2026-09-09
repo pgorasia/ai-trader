@@ -175,11 +175,17 @@ class CodexRunner:
                                 and exc.tool in APPROVED_SHADOW_ROBINHOOD_TOOLS
                             )
                             if approved_read_failure:
-                                diagnostics = {
+                                diagnostics = dict(exc.diagnostics or {})
+                                diagnostics.update({
                                     "code": "READ_ONLY_TOOL_DATA_UNAVAILABLE",
                                     "stage_reached": "TOOL_EXECUTION",
-                                    "observed_tool_summary": [{"name": exc.tool, "count": 1, "state": "FAILED"}],
-                                }
+                                    "observed_tool_summary": self._observed_tool_summary(
+                                        diagnostics.get("event_sequence", [])
+                                    ),
+                                    "teardown_classifier_reached": teardown_reached,
+                                    "teardown_classifier_result": warning if teardown_reached else None,
+                                    "teardown_diagnostic_code": ROBINHOOD_TEARDOWN_CODE if warning else None,
+                                })
                                 self._last_run_diagnostics = {
                                     "mcp_teardown_warning": False,
                                     "diagnostic_codes": ["READ_ONLY_TOOL_DATA_UNAVAILABLE"],
@@ -283,6 +289,23 @@ class CodexRunner:
             "codex_failure_diagnostics": diagnostics,
         }
         raise CodexRunError(message, diagnostics=diagnostics)
+
+    @staticmethod
+    def _observed_tool_summary(event_sequence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        counts: dict[tuple[str, str], int] = {}
+        for event in event_sequence:
+            if not isinstance(event, dict) or event.get("event") != "tool.completed":
+                continue
+            tool = event.get("tool")
+            if not isinstance(tool, str):
+                continue
+            state = "FAILED" if event.get("terminal_status") is not None else "COMPLETED"
+            key = (_safe_observed_tool_name(tool), state)
+            counts[key] = counts.get(key, 0) + 1
+        return [
+            {"name": tool, "count": count, "state": state}
+            for (tool, state), count in sorted(counts.items())
+        ]
 
     def verify_shadow_boundary(self) -> ShadowBoundaryResult:
         self._shadow_boundary = verify_shadow_mcp_boundary(self.codex_config_path)
