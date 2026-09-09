@@ -54,6 +54,7 @@ REQUIRED_PROJECT_FILES = (
     "scripts/install-scheduler.ps1",
     "scripts/check-scheduler.ps1",
     "schemas/luna-cycle.schema.json",
+    "schemas/historical-probe.schema.json",
     "schemas/senior-decision.schema.json",
     "schemas/eod-review.schema.json",
     "schemas/preflight.schema.json",
@@ -302,6 +303,11 @@ def _validate_removed_schema_invariants(data: dict[str, Any], schema_name: str) 
             for index, item in enumerate(data["baseline_external_orders"]): _symbol(item["symbol"], f"baseline_external_orders[{index}].symbol")
             if data["baseline_external_order_count"] != len(data["baseline_external_orders"]): raise SchemaValidationError("Baseline external order count does not match details")
             if data["baseline_external_orders_present"] != bool(data["baseline_external_orders"]): raise SchemaValidationError("Baseline external order presence does not match details")
+    elif schema_name == "historical-probe.schema.json":
+        _symbol(data["probe_symbol"], "probe_symbol"); _date(data["session_date"], "session_date")
+        if len(data["source_5m_bars"]) > 24: raise SchemaValidationError("Historical probe source_5m_bars exceeds 24 bars")
+        if len(data["errors"]) > 4: raise SchemaValidationError("Historical probe errors exceed its permitted maximum length")
+        for index, error in enumerate(data["errors"]): _nonempty(error, f"errors[{index}]")
     elif schema_name == "luna-cycle.schema.json":
         _nonempty(data["cycle_id"], "cycle_id"); _date(data["session_date"], "session_date"); _aware_timestamp(data["timestamp"], "timestamp")
         _nonempty(data["scanner"]["name"], "scanner.name"); _nonempty(data["scanner"]["id"], "scanner.id")

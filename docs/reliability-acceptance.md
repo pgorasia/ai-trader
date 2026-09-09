@@ -19,9 +19,12 @@ contains no broker or account data.
 
 ## Completed 15-minute structure
 
-The dedicated Luna live probe deterministically requires one approved
+The dedicated live historical probe uses its own minimal output schema and
+deterministically requires exactly one approved
 `get_equity_historicals` read for completed regular-session 5-minute bars. The
-Luna schema carries those source bars and Python validates them and derives at
+probe schema carries only the symbol, session, source bars, and bounded error
+diagnostics; it does not ask the model for unrelated VWAP, quote, scanner,
+account, or decision fields. Python validates the source bars and derives at
 least one completed 15-minute aggregate. Missing calls, malformed bars,
 forming/off-session bars, or source data that cannot form an aligned group all
 fail acceptance. Normal Stage-B still requires only reconciliation and scan

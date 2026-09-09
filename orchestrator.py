@@ -839,7 +839,7 @@ class ShadowOrchestrator:
                 "production_state_modified": False, "write_tools_exposed": False}
 
     def smoke_luna_schema(self, session_date: str) -> dict[str, Any]:
-        schema_path = self.root / "schemas" / "luna-cycle.schema.json"
+        schema_path = self.root / "schemas" / "historical-probe.schema.json"
         try:
             day = datetime.strptime(session_date, "%Y-%m-%d").date()
         except ValueError as exc:
@@ -854,20 +854,21 @@ class ShadowOrchestrator:
             context={"probe_symbol": "AAPL", "session": self._session_context(session)},
             required_robinhood_tools=frozenset({"get_equity_historicals"}),
             robinhood_enabled_tools=frozenset({"get_equity_historicals"}),
-            allow_web=False, working_directory=self.root,
+            exact_robinhood_tools=True, allow_web=False, working_directory=self.root,
         )
         if result.tool_calls != {"get_equity_historicals": 1} or result.web_searches:
             raise CodexRunError("Luna schema historical probe must observe exactly one historical read")
-        finalists = result.data.get("finalists", [])
-        if len(finalists) != 1 or finalists[0].get("symbol") != "AAPL":
+        if result.data.get("probe_symbol") != "AAPL" or result.data.get("session_date") != session.session_date:
             raise SchemaValidationError("Luna schema historical probe did not return its required source-bar object")
-        source = finalists[0].get("completed_5m_bars")
+        if result.data.get("errors"):
+            raise SchemaValidationError("Luna schema historical probe reported unavailable historical data")
+        source = result.data.get("source_5m_bars")
         if not isinstance(source, list) or not 3 <= len(source) <= 24:
             raise SchemaValidationError("Luna schema historical probe requires 3-24 completed source 5-minute bars")
         validate_bar_series(source, session_date=session.session_date,
             as_of=session.market_close, mandatory_flat=session.market_close)
-        self._derive_luna_15m(result.data, session, session.market_close)
-        derived = finalists[0].get("completed_15m_structure")
+        derived = aggregate_completed_15m(source, session_open=session.market_open,
+            session_close=session.market_close, as_of=session.market_close)
         if not derived:
             raise SchemaValidationError("Luna schema historical probe source bars did not produce a completed deterministic 15-minute aggregate")
         if _production_snapshot(self.root) != state_before:

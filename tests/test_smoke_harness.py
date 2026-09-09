@@ -111,26 +111,20 @@ class SmokeHarnessTests(unittest.TestCase):
             with self.subTest(missing=missing), self.assertRaises(SchemaValidationError):
                 core._validate_luna(damaged_cycle, state, session, 0, observed_tool_calls=damaged)
 
-    def luna_probe_result(self, *, calls=None, malformed=False):
-        cycle = json.loads((ROOT / "tests/fixtures/luna_candidate.json").read_text())
+    def luna_probe_result(self, *, calls=None, malformed=False, offsets=(0, 5, 10), complete=True):
         session = EquityMarketCalendar().session_for(date(2026, 8, 19))
         start = session.market_open
-        cycle.update({"cycle_id": "luna-schema-live", "session_date": session.session_date,
-            "scanner": {"name": "historical-acceptance", "id": "historical-acceptance"},
-            "timestamp": session.market_close.isoformat(), "scanner_total": 1,
-            "symbols_processed": ["AAPL"], "errors": [], "sol_escalation": False})
-        finalist = cycle["finalists"][0]
-        finalist.update({"symbol": "AAPL", "classification": "NEW", "material_requalification": None})
-        finalist["completed_5m_bars"] = [
+        data = {"probe_symbol": "AAPL", "session_date": session.session_date, "errors": []}
+        data["source_5m_bars"] = [
             {"timestamp": (start + timedelta(minutes=offset)).isoformat(), "open": 10,
              "high": 9 if malformed and offset == 0 else 11, "low": 9,
-             "close": 10, "volume": 100, "complete": True}
-            for offset in (0, 5, 10)]
-        return CodexRunResult(data=cycle,
+             "close": 10, "volume": 100, "complete": complete}
+            for offset in offsets]
+        return CodexRunResult(data=data,
             tool_calls={"get_equity_historicals": 1} if calls is None else calls)
 
     def test_luna_schema_live_probe_requires_history_and_preserves_production(self):
-        schema = ROOT / "schemas/luna-cycle.schema.json"
+        schema = ROOT / "schemas/historical-probe.schema.json"
         fake = Mock()
         fake.run.return_value = self.luna_probe_result()
         core = self.bare(ROOT, fake)
@@ -144,11 +138,16 @@ class SmokeHarnessTests(unittest.TestCase):
         self.assertEqual(call["schema_path"], schema)
         self.assertEqual(call["required_robinhood_tools"], frozenset({"get_equity_historicals"}))
         self.assertEqual(call["robinhood_enabled_tools"], frozenset({"get_equity_historicals"}))
+        self.assertTrue(call["exact_robinhood_tools"])
         self.assertEqual(call["working_directory"], ROOT)
         prompt = call["prompt_path"].read_text(encoding="utf-8")
         self.assertIn("Make exactly one `get_equity_historicals` call", prompt)
         self.assertIn("regular-session 5-minute OHLCV", prompt)
         self.assertIn("Python can exercise deterministic 15-minute aggregation", prompt)
+        self.assertIn("Do not return VWAP", prompt)
+        probe_schema = json.loads(schema.read_text())
+        self.assertNotIn("vwap", json.dumps(probe_schema).lower())
+        self.assertEqual(set(probe_schema["properties"]), {"probe_symbol", "session_date", "source_5m_bars", "errors"})
         self.assertEqual(before, orchestrator._production_snapshot(ROOT))
 
     def test_luna_schema_live_probe_fails_without_observed_historical_call(self):
@@ -160,6 +159,24 @@ class SmokeHarnessTests(unittest.TestCase):
         fake = Mock(); fake.run.return_value = self.luna_probe_result(malformed=True)
         with self.assertRaisesRegex(SchemaValidationError, "Malformed OHLC"):
             self.bare(ROOT, fake).smoke_luna_schema("2026-08-19")
+
+    def test_luna_schema_live_probe_rejects_incomplete_misaligned_outside_and_duplicate_bars(self):
+        cases = {
+            "incomplete": self.luna_probe_result(complete=False),
+            "misaligned": self.luna_probe_result(offsets=(1, 6, 11)),
+            "outside": self.luna_probe_result(offsets=(-5, 0, 5)),
+            "duplicate": self.luna_probe_result(offsets=(0, 0, 5)),
+        }
+        for name, result in cases.items():
+            fake = Mock(); fake.run.return_value = result
+            with self.subTest(name=name), self.assertRaises(SchemaValidationError):
+                self.bare(ROOT, fake).smoke_luna_schema("2026-08-19")
+
+    def test_production_luna_vwap_semantics_are_unchanged(self):
+        cycle = json.loads((ROOT / "tests/fixtures/luna_candidate.json").read_text())
+        cycle["finalists"][0]["vwap"] = 0
+        with self.assertRaisesRegex(SchemaValidationError, "vwap is outside its permitted bounds"):
+            validate_json(cycle, ROOT / "schemas/luna-cycle.schema.json")
 
     def test_runner_mcp_disabled_contract_has_no_servers_or_tools(self):
         runner = __import__("trader.codex_runner", fromlist=["CodexRunner"]).CodexRunner.__new__(__import__("trader.codex_runner", fromlist=["CodexRunner"]).CodexRunner)
