@@ -108,11 +108,18 @@ class CodexRunner:
         command.append("-")
         return command
 
-    def run(self, *, prompt_path: Path, schema_path: Path, model: str, context: dict[str, Any], required_robinhood_tools: frozenset[str], allow_web: bool = False, reasoning_effort: str | None = None, exact_robinhood_tools: bool = False, expected_robinhood_arguments: dict[str, dict[str, Any]] | None = None, robinhood_enabled_tools: frozenset[str] | None = None, disable_all_mcp: bool = False, working_directory: Path | None = None) -> CodexRunResult:
+    def run(self, *, prompt_path: Path, schema_path: Path, model: str, context: dict[str, Any], required_robinhood_tools: frozenset[str], allow_web: bool = False, reasoning_effort: str | None = None, exact_robinhood_tools: bool = False, expected_robinhood_arguments: dict[str, dict[str, Any]] | None = None, robinhood_enabled_tools: frozenset[str] | None = None, disable_all_mcp: bool = False, working_directory: Path | None = None, maximum_robinhood_tool_calls: dict[str, int] | None = None, require_web_search: bool = False) -> CodexRunResult:
         if not hasattr(self, "_shadow_boundary"):
             raise CodexRunError("Deterministic SHADOW MCP boundary was not verified at startup")
         if disable_all_mcp and (required_robinhood_tools or robinhood_enabled_tools is not None):
             raise CodexRunError("MCP-disabled jobs cannot require or expose Robinhood tools")
+        if require_web_search and not allow_web:
+            raise CodexRunError("A required web search cannot be configured when web access is disabled")
+        if maximum_robinhood_tool_calls is not None and any(
+            name not in APPROVED_SHADOW_ROBINHOOD_TOOLS or not isinstance(limit, int) or limit < 1
+            for name, limit in maximum_robinhood_tool_calls.items()
+        ):
+            raise CodexRunError("Maximum Robinhood call limits are malformed or outside SHADOW policy")
         if robinhood_enabled_tools is not None:
             outside_policy = robinhood_enabled_tools - APPROVED_SHADOW_ROBINHOOD_TOOLS
             unavailable = robinhood_enabled_tools - self._shadow_boundary.enabled_tools
@@ -250,7 +257,22 @@ class CodexRunner:
                         self._raise_observed_tool_error(f"Prohibited observed tool activity: {', '.join(prohibited)}", parsed.tool_calls)
                     missing = sorted(required_robinhood_tools - robinhood_calls.keys())
                     if missing:
-                        self._raise_observed_tool_error(f"Required Robinhood tool calls were not observed: {', '.join(missing)}", parsed.tool_calls, missing_required_tools=missing)
+                        self._raise_observed_tool_error(f"Required Robinhood tool calls were not observed: {', '.join(missing)}", parsed.tool_calls, missing_required_tools=missing, events=parsed.events, agent_messages=parsed.agent_messages)
+                    if require_web_search and parsed.web_searches < 1:
+                        self._raise_observed_tool_error(
+                            "Required targeted web research was not observed", parsed.tool_calls,
+                            events=parsed.events, agent_messages=parsed.agent_messages,
+                        )
+                    if maximum_robinhood_tool_calls is not None:
+                        exceeded = sorted(
+                            name for name, limit in maximum_robinhood_tool_calls.items()
+                            if robinhood_calls.get(name, 0) > limit
+                        )
+                        if exceeded:
+                            self._raise_observed_tool_error(
+                                "Robinhood candidate-enrichment fanout exceeded its operation bound: " + ", ".join(exceeded),
+                                parsed.tool_calls, events=parsed.events, agent_messages=parsed.agent_messages,
+                            )
                     if exact_robinhood_tools:
                         non_mcp = sorted(name for name in parsed.tool_calls if "::" not in name)
                         unexpected = sorted(robinhood_calls.keys() - required_robinhood_tools)
@@ -284,7 +306,14 @@ class CodexRunner:
 
     def _raise_observed_tool_error(self, message: str, tool_calls: dict[str, int], *,
                                    foreign_mcp: list[str] | None = None,
-                                   missing_required_tools: list[str] | None = None) -> None:
+                                   missing_required_tools: list[str] | None = None,
+                                   events: list[dict[str, Any]] | None = None,
+                                   agent_messages: int | None = None) -> None:
+        event_types: dict[str, int] = {}
+        for event in events or []:
+            event_type = event.get("type")
+            if isinstance(event_type, str):
+                event_types[event_type] = event_types.get(event_type, 0) + 1
         diagnostics = {
             "observed_tool_summary": [
                 {"name": _safe_observed_tool_name(name), "count": int(count)}
@@ -292,6 +321,9 @@ class CodexRunner:
             ],
             "foreign_mcp": [_safe_observed_tool_name(name) for name in (foreign_mcp or [])],
             "missing_required_tools": sorted(_safe_observed_tool_name(name) for name in (missing_required_tools or [])),
+            "event_summary": {"event_type_counts": event_types, "agent_message_count": agent_messages or 0},
+            "required_tool_validation_reached": True,
+            "required_tool_validation_passed": not missing_required_tools,
         }
         self._last_run_diagnostics = {
             "mcp_teardown_warning": False,

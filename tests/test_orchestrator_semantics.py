@@ -138,10 +138,11 @@ class OrchestratorSemanticTests(unittest.TestCase):
         with self.assertRaises(SchemaValidationError):
             self.core._validate_senior(decision, finalists, initial_state("2026-08-14"), self.session, 3)
 
-    def test_luna_duplicate_and_invented_finalists_rejected(self):
+    def test_luna_identical_duplicates_collapse_and_invented_finalists_rejected(self):
         cycle = self.fixture("luna_candidate.json")
         cycle["finalists"].append(deepcopy(cycle["finalists"][0]))
-        with self.assertRaises(SchemaValidationError): self.core._validate_luna(cycle, initial_state("2026-08-14"), self.session, 0)
+        self.core._validate_luna(cycle, initial_state("2026-08-14"), self.session, 0)
+        self.assertEqual(len(cycle["finalists"]), 1)
         cycle = self.fixture("luna_candidate.json"); cycle["finalists"][0]["symbol"] = "FAKE"
         with self.assertRaises(SchemaValidationError): self.core._validate_luna(cycle, initial_state("2026-08-14"), self.session, 0)
 

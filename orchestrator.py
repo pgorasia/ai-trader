@@ -326,6 +326,7 @@ class ShadowOrchestrator:
         }
         def validate_stage_b(observed) -> None:
             cycle = observed.data
+            self._normalize_luna_symbols(cycle)
             cycle["tool_call_count"] = {"total": sum(observed.tool_calls.values()),
                                         "run_scan": observed.tool_calls.get("run_scan", 0)}
             ended = self._trusted_now()
@@ -348,9 +349,15 @@ class ShadowOrchestrator:
             result_validator=validate_stage_b,
             required_robinhood_tools=frozenset({"get_accounts", "get_equity_orders", "get_equity_positions", "run_scan"}),
             allow_web=False, robinhood_enabled_tools=JOB_TOOL_CONTRACTS["STAGE_B"],
+            maximum_robinhood_tool_calls={
+                "get_accounts": 1, "get_equity_orders": 1, "get_equity_positions": 1, "run_scan": 1,
+                "get_equity_quotes": 4, "get_equity_tradability": 4,
+                "get_equity_historicals": 4, "get_equity_technical_indicators": 12,
+            },
         )
         luna_ended = self._trusted_now()
         cycle = result.data
+        self._normalize_luna_symbols(cycle)
         # The parsed successful event stream, not model bookkeeping, is the
         # source of truth for directly observable call counts and escalation.
         cycle["tool_call_count"] = {
@@ -364,6 +371,7 @@ class ShadowOrchestrator:
                     for item in cycle.get("finalists", []))
         )
         self._validate_luna(cycle, state, session, result.web_searches, expected_cycle_id=cycle_id, observed_tool_calls=result.tool_calls, observed_start=luna_started, observed_end=luna_ended)
+        cycle["revisit_observations"] = self._revisit_observations(cycle, state, scheduled_for)
         cycle["scheduled_for"] = scheduled_for.isoformat()
         cycle["cli_usage"] = result.usage
         cycle["cli_tool_calls"] = result.tool_calls
@@ -475,6 +483,7 @@ class ShadowOrchestrator:
                 context=context, result_validator=validate_senior_result,
                 required_robinhood_tools=JOB_TOOL_CONTRACTS["SOL_SENIOR"], allow_web=True,
                 robinhood_enabled_tools=JOB_TOOL_CONTRACTS["SOL_SENIOR"],
+                require_web_search=True,
             )
             decision = result.data
             decision.update({
@@ -986,6 +995,7 @@ class ShadowOrchestrator:
         }
 
     def _validate_luna(self, cycle: dict[str, Any], state: dict[str, Any], session, web_searches: int, *, expected_cycle_id: str | None = None, observed_tool_calls: dict[str, int] | None = None, observed_start: datetime | None = None, observed_end: datetime | None = None) -> None:
+        self._normalize_luna_symbols(cycle)
         self._derive_luna_15m(cycle, session, observed_start or aware(cycle["timestamp"]))
         if web_searches:
             raise SchemaValidationError("Luna used prohibited web search")
@@ -1012,8 +1022,6 @@ class ShadowOrchestrator:
                 raise SchemaValidationError("Luna reconciliation and scan calls must each complete exactly once: " + ", ".join(bad_counts))
         symbols = cycle["symbols_processed"]
         finalist_symbols = [item["symbol"] for item in cycle["finalists"]]
-        if len(finalist_symbols) != len(set(finalist_symbols)):
-            raise SchemaValidationError("Luna returned duplicate finalists")
         if not set(finalist_symbols) <= set(symbols):
             raise SchemaValidationError("Luna invented a finalist outside symbols_processed")
         if not isinstance(cycle["scanner_total"], int) or cycle["scanner_total"] < len(symbols) or cycle["scanner_total"] > 1_000_000:
@@ -1077,6 +1085,41 @@ class ShadowOrchestrator:
         )
         if aware(cycle["timestamp"]).astimezone(ET) >= session.latest_entry and cycle["sol_escalation"]:
             raise SchemaValidationError("Luna escalated after the latest-entry cutoff")
+
+    @staticmethod
+    def _normalize_luna_symbols(cycle: dict[str, Any]) -> None:
+        """Canonicalize identities and collapse only semantically identical finalists."""
+        cycle["symbols_processed"] = list(dict.fromkeys(
+            str(symbol).strip().upper() for symbol in cycle.get("symbols_processed", [])
+        ))
+        normalized: list[dict[str, Any]] = []
+        by_symbol: dict[str, dict[str, Any]] = {}
+        for raw in cycle.get("finalists", []):
+            item = raw
+            item["symbol"] = str(item.get("symbol", "")).strip().upper()
+            prior = by_symbol.get(item["symbol"])
+            if prior is None:
+                by_symbol[item["symbol"]] = item
+                normalized.append(item)
+            elif prior != item:
+                raise SchemaValidationError(f"Luna returned conflicting duplicate finalist evidence for {item['symbol']}")
+        cycle["finalists"] = normalized
+
+    @staticmethod
+    def _revisit_observations(cycle: dict[str, Any], state: dict[str, Any], scheduled_for: datetime) -> list[dict[str, Any]]:
+        processed = set(cycle.get("symbols_processed", []))
+        classifications = {item["symbol"]: item["classification"] for item in cycle.get("finalists", [])}
+        observations = []
+        for symbol, rejection in sorted(state.get("cooldowns", {}).items()):
+            seen = symbol in processed
+            observations.append({
+                "symbol": symbol,
+                "scanner_seen": seen,
+                "cooldown_active": scheduled_for < aware(rejection["cooldown_until"]),
+                "disposition": classifications.get(symbol, "SEEN_NOT_FINALIST" if seen else "NOT_SCANNED"),
+                "prior_rejection_categories": list(rejection.get("rejection_categories", [])),
+            })
+        return observations
 
     def _validate_senior(self, decision: dict[str, Any], finalists: list[dict[str, Any]], state: dict[str, Any], session, web_searches: int, *, observed_tool_calls: dict[str, int] | None = None, observed_start: datetime | None = None, observed_end: datetime | None = None, allow_research_concurrency: bool = False) -> None:
         decision["web_search_count"] = web_searches
