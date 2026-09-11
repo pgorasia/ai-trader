@@ -18,6 +18,7 @@
     "entry_trigger",
     "entry_trigger_type",
     "entry_condition",
+    "entry_requires_qualitative_confirmation",
     "maximum_chase_price",
     "stop_price",
     "stop_basis",
@@ -29,6 +30,8 @@
     "planned_account_risk_percent",
     "reward_risk_target1",
     "invalidation_condition",
+    "pre_entry_invalidation_price",
+    "pre_entry_invalidation_type",
     "time_exit",
     "latest_entry_time",
     "mandatory_flat_time",
@@ -176,6 +179,9 @@
         "null"
       ]
     },
+    "entry_requires_qualitative_confirmation": {
+      "type": ["boolean", "null"]
+    },
     "maximum_chase_price": {
       "type": [
         "number",
@@ -241,6 +247,13 @@
         "string",
         "null"
       ]
+    },
+    "pre_entry_invalidation_price": {
+      "type": ["number", "null"]
+    },
+    "pre_entry_invalidation_type": {
+      "type": ["string", "null"],
+      "enum": ["COMPLETED_5M_CLOSE_BELOW", null]
     },
     "time_exit": {
       "type": [

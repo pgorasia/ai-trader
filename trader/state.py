@@ -17,7 +17,7 @@ STATE_SCHEMA_VERSION = 2
 STRATEGY_VERSION = "ai-daytrader-v1-accelerated-shadow-2026-08"
 STATE_MIGRATION_POLICY = "No implicit migrations. Unsupported versions require an explicit, reviewed migration."
 STATE_LIST_FIELDS = ("cycles", "senior_decisions", "shadow_plans", "shadow_positions", "completed_shadow_trades", "errors", "security_events", "schedule_events", "operation_ids")
-FINAL_OUTCOMES = {"TARGET1", "STOPPED", "FLAT_TIME", "EXPIRED", "AMBIGUOUS"}
+FINAL_OUTCOMES = {"TARGET1", "STOPPED", "FLAT_TIME", "PRE_ENTRY_INVALIDATED", "EXPIRED", "AMBIGUOUS"}
 
 
 def _aware(value: Any, label: str) -> datetime:
@@ -218,6 +218,8 @@ def validate_state_shape(state: Any, expected_date: str | None = None) -> None:
             raise StateCorruptionError("OPEN plan lacks entry timestamp")
         if status in {"TARGET1", "STOPPED", "FLAT_TIME"} and (plan["outcome"].get("entry_timestamp") is None or plan["outcome"].get("entry_price") is None or plan["outcome"].get("exit_timestamp") is None or plan["outcome"].get("pnl") is None):
             raise StateCorruptionError("Completed plan lacks exit provenance")
+        if status == "PRE_ENTRY_INVALIDATED" and (plan["outcome"].get("entry_triggered") or plan["outcome"].get("entry_timestamp") or not plan["outcome"].get("exit_timestamp")):
+            raise StateCorruptionError("Pre-entry-invalidated plan has inconsistent entry provenance")
         entry_timestamp = plan["outcome"].get("entry_timestamp")
         exit_timestamp = plan["outcome"].get("exit_timestamp")
         entry_time = _aware(entry_timestamp, "outcome entry timestamp") if entry_timestamp else None

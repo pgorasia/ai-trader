@@ -32,6 +32,7 @@ class ReadinessStatus(StrEnum):
 class ShadowPlanStatus(StrEnum):
     PENDING = "PENDING"
     OPEN = "OPEN"
+    PRE_ENTRY_INVALIDATED = "PRE_ENTRY_INVALIDATED"
     TARGET1 = "TARGET1"
     STOPPED = "STOPPED"
     FLAT_TIME = "FLAT_TIME"

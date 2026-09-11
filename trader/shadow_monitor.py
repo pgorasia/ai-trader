@@ -50,8 +50,10 @@ def validate_bar_series(bars: list[dict[str, Any]], *, session_date: str, as_of:
     validated = []
     for bar in bars:
         validate_bar(bar)
+        # The collector is required to label the current forming bar. It is
+        # valid transport data, but never eligible market evidence.
         if bar.get("complete") is not True:
-            raise SchemaValidationError("Incomplete bar cannot be used by ShadowPlanMonitor")
+            continue
         timestamp = _dt(bar["timestamp"]).astimezone(ET)
         if timestamp.date() != session_day:
             raise SchemaValidationError("Bar belongs to the wrong market session date")
@@ -120,7 +122,7 @@ def aggregate_completed_15m(
 class ShadowPlanMonitor:
     """Resolve immutable long-plan outcomes from completed 5-minute OHLCV."""
 
-    def evaluate(self, plan_record: dict[str, Any], bars: list[dict[str, Any]], as_of: datetime | None = None) -> dict[str, Any]:
+    def evaluate(self, plan_record: dict[str, Any], bars: list[dict[str, Any]], as_of: datetime | None = None, *, qualitative_entry_confirmed: bool | None = None) -> dict[str, Any]:
         record = deepcopy(plan_record)
         plan = record["original_plan"]
         outcome = deepcopy(record.get("outcome") or self.initial_outcome())
@@ -138,6 +140,8 @@ class ShadowPlanMonitor:
         stop = float(plan["stop_price"])
         target = float(plan["target1"])
         target2 = plan.get("target2_optional")
+        pre_entry_invalidation = plan.get("pre_entry_invalidation_price")
+        pre_entry_invalidation_type = plan.get("pre_entry_invalidation_type")
         ordered = validate_bar_series(bars, session_date=decision_time.astimezone(ET).date().isoformat(), as_of=as_of, mandatory_flat=mandatory_flat)
         ordered = [bar for bar in ordered if _dt(bar["timestamp"]) >= first_eligible]
         entry_bar_time = _dt(outcome["entry_bar_timestamp"]) if outcome.get("entry_bar_timestamp") else None
@@ -146,11 +150,17 @@ class ShadowPlanMonitor:
 
         for index, bar in enumerate(ordered):
             timestamp = _dt(bar["timestamp"])
+            outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
             if outcome["status"] == ShadowPlanStatus.PENDING:
                 if timestamp >= latest_entry:
                     break
+                if self._pre_entry_invalidated(bar, pre_entry_invalidation, pre_entry_invalidation_type):
+                    self._invalidate_before_entry(outcome, timestamp, bar)
+                    break
                 entry = self._entry_price(plan, bar, trigger, chase)
                 if entry is None:
+                    continue
+                if plan.get("entry_requires_qualitative_confirmation", False) and qualitative_entry_confirmed is not True:
                     continue
                 outcome.update({
                     "status": ShadowPlanStatus.OPEN,
@@ -218,7 +228,7 @@ class ShadowPlanMonitor:
         record["outcome"] = outcome
         return record
 
-    def evaluate_trailing(self, plan_record: dict[str, Any], bars: list[dict[str, Any]], as_of: datetime | None = None) -> dict[str, Any]:
+    def evaluate_trailing(self, plan_record: dict[str, Any], bars: list[dict[str, Any]], as_of: datetime | None = None, *, qualitative_entry_confirmed: bool | None = None) -> dict[str, Any]:
         """Evaluate a no-lookahead two-bar structure trail from the same entry."""
         record = deepcopy(plan_record)
         plan = record["original_plan"]
@@ -234,6 +244,8 @@ class ShadowPlanMonitor:
         mandatory_flat = _dt(plan["mandatory_flat_time"])
         trigger, chase = float(plan["entry_trigger"]), float(plan["maximum_chase_price"])
         initial_stop = float(plan["stop_price"])
+        pre_entry_invalidation = plan.get("pre_entry_invalidation_price")
+        pre_entry_invalidation_type = plan.get("pre_entry_invalidation_type")
         quantity = float(plan["hypothetical_quantity"])
         activation_r = float(plan.get("trailing_activation_r", 1.0))
         lookback = int(plan.get("trailing_lookback_bars", 2))
@@ -250,8 +262,15 @@ class ShadowPlanMonitor:
             if outcome["status"] == ShadowPlanStatus.PENDING:
                 if timestamp >= latest_entry:
                     break
+                if self._pre_entry_invalidated(bar, pre_entry_invalidation, pre_entry_invalidation_type):
+                    self._invalidate_before_entry(outcome, timestamp, bar)
+                    outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
+                    break
                 entry = self._entry_price(plan, bar, trigger, chase)
                 if entry is None:
+                    outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
+                    continue
+                if plan.get("entry_requires_qualitative_confirmation", False) and qualitative_entry_confirmed is not True:
                     outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
                     continue
                 outcome.update({
@@ -321,6 +340,27 @@ class ShadowPlanMonitor:
         return record
 
     @staticmethod
+    def _pre_entry_invalidated(bar: dict[str, Any], price: Any, invalidation_type: Any) -> bool:
+        if price is None and invalidation_type is None:
+            return False
+        if price is None or invalidation_type != "COMPLETED_5M_CLOSE_BELOW":
+            raise SchemaValidationError("Malformed structured pre-entry invalidation")
+        threshold = float(price)
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise SchemaValidationError("Invalid pre-entry invalidation price")
+        return float(bar["close"]) < threshold
+
+    @staticmethod
+    def _invalidate_before_entry(outcome: dict[str, Any], timestamp: datetime, bar: dict[str, Any]) -> None:
+        outcome.update({
+            "status": ShadowPlanStatus.PRE_ENTRY_INVALIDATED,
+            "entry_before_cutoff": False,
+            "exit_reason": "PRE_ENTRY_INVALIDATION_COMPLETED_5M_CLOSE",
+            "exit_timestamp": timestamp.isoformat(),
+            "pre_entry_invalidation_close": float(bar["close"]),
+        })
+
+    @staticmethod
     def _entry_price(plan: dict[str, Any], bar: dict[str, Any], trigger: float, chase: float) -> tuple[float, bool, bool] | None:
         if plan["entry_trigger_type"] == "COMPLETED_5M_CLOSE_AT_OR_ABOVE":
             close = float(bar["close"])
@@ -366,6 +406,7 @@ class ShadowPlanMonitor:
             "entry_via_open": False,
             "entry_at_close": False,
             "entry_before_cutoff": None,
+            "last_processed_bar_timestamp": None,
             "stop_hit": False,
             "target1_hit": False,
             "target2_hit": False,

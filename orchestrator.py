@@ -525,17 +525,40 @@ class ShadowOrchestrator:
         monitor_operation = f"monitor:{now.astimezone(ET).isoformat()}"
         if monitor_operation in state["operation_ids"]:
             return
+        # Cutoff expiry needs no market observation. Resolve it before paying
+        # for a collector subprocess; OPEN plans still require a fresh bar for
+        # their time/price exit.
+        updated_by_id: dict[str, dict[str, Any]] = {}
+        for plan in state["shadow_plans"]:
+            latest_entry = plan["original_plan"].get("latest_entry_time")
+            if plan["outcome"].get("status") == "PENDING" and latest_entry and now >= aware(latest_entry):
+                updated = self.monitor.evaluate(plan, [], now)
+                updated_by_id[plan["plan_id"]] = self.monitor.evaluate_trailing(updated, [], now)
+        if updated_by_id:
+            state["shadow_plans"] = [updated_by_id.get(item["plan_id"], item) for item in state["shadow_plans"]]
         active = [plan for plan in state["shadow_plans"] if self._plan_is_active(plan)]
         if not active:
             state["shadow_positions"] = []
+            self._record_completed_trades(state)
+            self.store.save(state)
             return
+        def monitor_start(item: dict[str, Any]) -> str:
+            candidates = [item["original_plan"]["decision_timestamp"]]
+            for key in ("outcome", "trailing_outcome"):
+                processed = item.get(key, {}).get("last_processed_bar_timestamp")
+                if processed:
+                    candidates.append(processed)
+            return max(candidates, key=aware)
+
         context = {
             "timestamp": now.astimezone(ET).isoformat(),
-            "plans": [{"plan_id": item["plan_id"], "symbol": item["original_plan"]["symbol"], "start_time": item["original_plan"]["decision_timestamp"]} for item in active],
+            "plans": [{"plan_id": item["plan_id"], "symbol": item["original_plan"]["symbol"], "start_time": monitor_start(item)} for item in active],
         }
         def validate_monitor_result(observed) -> None:
-            if observed.web_searches or observed.data["errors"]:
-                raise CodexRunError("Shadow monitor returned a prohibited web call or read error")
+            if observed.web_searches:
+                raise CodexRunError("Shadow monitor returned prohibited web activity")
+            if observed.data["errors"]:
+                raise CodexRunError("Shadow monitor returned read-data errors")
             missing = sorted(
                 plan["original_plan"]["symbol"]
                 for plan in active
@@ -550,12 +573,17 @@ class ShadowOrchestrator:
             context=context, result_validator=validate_monitor_result,
             required_robinhood_tools=JOB_TOOL_CONTRACTS["MONITOR"],
             allow_web=False, robinhood_enabled_tools=JOB_TOOL_CONTRACTS["MONITOR"],
+            maximum_robinhood_tool_calls={
+                "get_equity_historicals": len({item["original_plan"]["symbol"] for item in active})
+            },
         )
         if result.diagnostics.get("mcp_teardown_warning"):
             state.setdefault("runtime_diagnostics", []).append({"operation_id": monitor_operation, **result.diagnostics})
-        if result.web_searches or result.data["errors"]:
-            raise CodexRunError("Shadow monitor returned a prohibited web call or read error")
-        updated_by_id: dict[str, dict[str, Any]] = {}
+        if result.web_searches:
+            raise CodexRunError("Shadow monitor returned prohibited web activity")
+        if result.data["errors"]:
+            raise CodexRunError("Shadow monitor returned read-data errors")
+        updated_by_id = {}
         for plan in active:
             symbol = plan["original_plan"]["symbol"]
             if symbol not in result.data["symbol_bars"]:
@@ -748,7 +776,9 @@ class ShadowOrchestrator:
             try:
                 if self._active_plan_count(state):
                     self.monitor_active_plans(state, self._trusted_now())
-                elif event_time in scan_slots and event_time < session.latest_entry:
+                # A terminal unentered plan releases this scheduled scan. An
+                # OPEN or still-PENDING plan continues to own the slot.
+                if not self._active_plan_count(state) and event_time in scan_slots and event_time < session.latest_entry:
                     actual = self._trusted_now()
                     if self.scheduler.is_stale(event_time, actual):
                         operation_id = f"stale-slot:{event_time.isoformat()}"
@@ -1155,6 +1185,8 @@ class ShadowOrchestrator:
             if any(plan["outcome"].get("entry_triggered") for plan in state["shadow_plans"] if plan.get("research_role", "PRIMARY") == "PRIMARY"):
                 raise SchemaValidationError("V1 permits no more than one entered Shadow trade per session")
             risk = self.config["risk"]
+            if not isinstance(decision.get("entry_requires_qualitative_confirmation"), bool):
+                raise SchemaValidationError("Senior plan must classify qualitative entry confirmation")
             entry, chase, stop, target = (float(decision[key]) for key in ("entry_trigger", "maximum_chase_price", "stop_price", "target1"))
             quantity = float(decision["hypothetical_quantity"])
             numeric = [entry, chase, stop, target, quantity, float(decision["hypothetical_notional"]), float(decision["planned_dollar_risk"]), float(decision["planned_account_risk_percent"]), float(decision["reward_risk_target1"])]
@@ -1165,6 +1197,16 @@ class ShadowOrchestrator:
                 raise SchemaValidationError("Senior plan contains non-finite or non-positive values")
             if not (0 < stop < entry <= chase < target):
                 raise SchemaValidationError("Long plan prices are not structurally ordered")
+            invalidation_price = decision.get("pre_entry_invalidation_price")
+            invalidation_type = decision.get("pre_entry_invalidation_type")
+            if (invalidation_price is None) != (invalidation_type is None):
+                raise SchemaValidationError("Pre-entry invalidation type and price must be supplied together")
+            if invalidation_price is not None and (
+                invalidation_type != "COMPLETED_5M_CLOSE_BELOW"
+                or not math.isfinite(float(invalidation_price))
+                or float(invalidation_price) <= 0
+            ):
+                raise SchemaValidationError("Malformed structured pre-entry invalidation")
             if float(decision["current_price"]) > chase:
                 raise SchemaValidationError("Senior plan is already beyond its maximum chase price")
             if decision["target2_optional"] is not None and float(decision["target2_optional"]) <= target:
@@ -1224,9 +1266,11 @@ class ShadowOrchestrator:
         plan_fields = {
             "symbol", "current_price", "quote_timestamp", "catalyst", "catalyst_classification",
             "market_regime", "setup_type", "entry_trigger", "entry_trigger_type", "entry_condition",
+            "entry_requires_qualitative_confirmation",
             "maximum_chase_price", "stop_price", "stop_basis", "target1", "target2_optional",
             "hypothetical_notional", "hypothetical_quantity", "planned_dollar_risk",
             "planned_account_risk_percent", "reward_risk_target1", "invalidation_condition",
+            "pre_entry_invalidation_price", "pre_entry_invalidation_type",
             "time_exit", "latest_entry_time", "mandatory_flat_time", "confidence",
         }
         if any(decision[field] is not None for field in plan_fields):
@@ -1288,7 +1332,7 @@ class ShadowOrchestrator:
                     "mfe": outcome["mfe"], "mae": outcome["mae"], "target2_hit": outcome["target2_hit"],
                 })
             for variant, variant_outcome in (("FIXED_TARGET", outcome), ("TRAILING_STOP", record.get("trailing_outcome"))):
-                if not variant_outcome or (record["plan_id"], variant) in existing_research or variant_outcome.get("status") not in {"TARGET1", "STOPPED", "FLAT_TIME", "EXPIRED", "AMBIGUOUS"}:
+                if not variant_outcome or (record["plan_id"], variant) in existing_research or variant_outcome.get("status") not in {"TARGET1", "STOPPED", "FLAT_TIME", "PRE_ENTRY_INVALIDATED", "EXPIRED", "AMBIGUOUS"}:
                     continue
                 research.append({
                     "plan_id": record["plan_id"], "variant": variant, "research_role": record.get("research_role", "PRIMARY"),

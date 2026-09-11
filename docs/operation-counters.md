@@ -11,3 +11,11 @@
 - `session_circuit_breaker_trips`: transitions from closed to open in a session.
 
 Legacy `luna_runs`, `sol_runs`, `monitor_runs`, `eod_runs`, and `failed_runs` remain for compatibility. They do not define subprocess-attempt or operation-terminal semantics.
+
+For monitors specifically, `monitor_completed_runs` is incremented when the
+collector subprocess and its response validator complete. `monitor_runs` is
+incremented only after deterministic bar validation, both exit variants, and
+the resulting state have been persisted. Therefore the former can exceed the
+latter when valid collector output subsequently fails deterministic market-data
+validation (for example, the historical Sep-11 forming-bar failures). This is
+intentional stage accounting, not a count of completed plans or variants.
