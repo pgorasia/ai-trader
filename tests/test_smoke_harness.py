@@ -270,7 +270,8 @@ class SmokeHarnessTests(unittest.TestCase):
         runner = __import__("trader.codex_runner", fromlist=["CodexRunner"]).CodexRunner.__new__(__import__("trader.codex_runner", fromlist=["CodexRunner"]).CodexRunner)
         runner.executable = "codex"; runner.project_root = ROOT
         command = runner.build_command("gpt-5.6-luna", ROOT / "schemas/luna-cycle.schema.json", Path("/tmp/out"), allow_web=False, disable_all_mcp=True)
-        self.assertIn("mcp_servers={}", command)
+        self.assertIn("mcp_servers.robinhood-trading.enabled=false", command)
+        self.assertNotIn("mcp_servers={}", command)
         self.assertNotIn("enabled_tools", " ".join(command))
         self.assertEqual(command[command.index("--cd") + 1], str(ROOT))
         self.assertNotEqual(command[command.index("--output-last-message") + 1], str(ROOT))

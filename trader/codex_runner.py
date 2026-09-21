@@ -99,7 +99,7 @@ class CodexRunner:
         if reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
         if disable_all_mcp:
-            command.extend(["--config", "mcp_servers={}"])
+            command.extend(["--config", "mcp_servers.robinhood-trading.enabled=false"])
         if robinhood_enabled_tools is not None:
             override = build_robinhood_enabled_tools_override(self._shadow_boundary.server_name, robinhood_enabled_tools)
             command.extend(["--config", override])
