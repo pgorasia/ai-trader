@@ -10,6 +10,7 @@ from .market_calendar import EquityMarketCalendar
 from .experiment import calculate_experiment
 from .models import ReadinessStatus, StateCorruptionError
 from .state import validate_state_shape
+from .lifecycle import completed_eod_operation_id
 
 
 def _finite(value: Any, label: str) -> float:
@@ -49,7 +50,9 @@ def calculate_readiness(states: list[dict[str, Any]], config: dict[str, Any]) ->
     valid_sessions = 0
     for state in states:
         validate_state_shape(state)
-        if not state["eod_completed"] or f"eod:{state['session_date']}" not in state["operation_ids"] or not isinstance(state.get("eod_review"), dict) or state["eod_review"].get("session_date") != state["session_date"]:
+        if (not state["eod_completed"] or completed_eod_operation_id(state) is None
+                or not isinstance(state.get("eod_review"), dict)
+                or state["eod_review"].get("session_date") != state["session_date"]):
             continue
         if calendar.session_for(datetime.fromisoformat(state["session_date"]).date()) is None:
             raise StateCorruptionError("Readiness state is not an XNYS session")

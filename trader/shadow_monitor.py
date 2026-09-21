@@ -6,6 +6,9 @@ import math
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .lifecycle import (evaluate_entry_cutoff, evaluate_pre_entry_invalidation,
+                        evaluate_stop, evaluate_target, evaluate_time_exit,
+                        evaluate_trailing_stop)
 from .models import SchemaValidationError, ShadowPlanStatus
 
 
@@ -198,8 +201,8 @@ class ShadowPlanMonitor:
             if target2 is not None and float(bar["high"]) >= float(target2):
                 outcome["target2_hit"] = True
 
-            stop_hit = float(bar["low"]) <= stop
-            target_hit = float(bar["high"]) >= target
+            stop_hit = evaluate_stop(plan, bar, stop)
+            target_hit = evaluate_target(plan, bar)
             crossed_from_below = same_entry_bar and not outcome.get("entry_via_open", False)
             if stop_hit and target_hit:
                 self._ambiguous(outcome, timestamp, "STOP_AND_TARGET_SAME_5M_BAR")
@@ -216,9 +219,9 @@ class ShadowPlanMonitor:
                 break
 
         current = as_of
-        if outcome["status"] == ShadowPlanStatus.PENDING and current >= latest_entry:
+        if outcome["status"] == ShadowPlanStatus.PENDING and evaluate_entry_cutoff(plan, current):
             outcome.update({"status": ShadowPlanStatus.EXPIRED, "entry_before_cutoff": False, "exit_reason": "ENTRY_NOT_TRIGGERED_BEFORE_CUTOFF"})
-        elif outcome["status"] == ShadowPlanStatus.OPEN and current >= mandatory_flat:
+        elif outcome["status"] == ShadowPlanStatus.OPEN and evaluate_time_exit(plan, current):
             eligible = [bar for bar in ordered if _dt(bar["timestamp"]) + timedelta(minutes=5) <= mandatory_flat]
             if eligible:
                 proxy = eligible[-1]
@@ -323,15 +326,15 @@ class ShadowPlanMonitor:
                 outcome["trailing_active"] = True
             if outcome.get("trailing_active") and len(lows) == lookback:
                 candidate = min(lows)
-                new_stop = max(active_stop, candidate)
+                new_stop = evaluate_trailing_stop(active_stop, lows)
                 if new_stop > active_stop:
                     outcome["trailing_stop"] = new_stop
                     outcome["trailing_updates"] = int(outcome.get("trailing_updates", 0)) + 1
             outcome["last_processed_bar_timestamp"] = timestamp.isoformat()
 
-        if outcome["status"] == ShadowPlanStatus.PENDING and as_of >= latest_entry:
+        if outcome["status"] == ShadowPlanStatus.PENDING and evaluate_entry_cutoff(plan, as_of):
             outcome.update({"status": ShadowPlanStatus.EXPIRED, "entry_before_cutoff": False, "exit_reason": "ENTRY_NOT_TRIGGERED_BEFORE_CUTOFF"})
-        elif outcome["status"] == ShadowPlanStatus.OPEN and as_of >= mandatory_flat:
+        elif outcome["status"] == ShadowPlanStatus.OPEN and evaluate_time_exit(plan, as_of):
             eligible = [bar for bar in validate_bar_series(bars, session_date=decision_time.astimezone(ET).date().isoformat(), as_of=as_of, mandatory_flat=mandatory_flat) if _dt(bar["timestamp"]) + timedelta(minutes=5) <= mandatory_flat]
             if eligible:
                 self._close(outcome, ShadowPlanStatus.FLAT_TIME, mandatory_flat, float(eligible[-1]["close"]), plan)
@@ -341,14 +344,14 @@ class ShadowPlanMonitor:
 
     @staticmethod
     def _pre_entry_invalidated(bar: dict[str, Any], price: Any, invalidation_type: Any) -> bool:
-        if price is None and invalidation_type is None:
-            return False
-        if price is None or invalidation_type != "COMPLETED_5M_CLOSE_BELOW":
-            raise SchemaValidationError("Malformed structured pre-entry invalidation")
-        threshold = float(price)
-        if not math.isfinite(threshold) or threshold <= 0:
-            raise SchemaValidationError("Invalid pre-entry invalidation price")
-        return float(bar["close"]) < threshold
+        try:
+            return evaluate_pre_entry_invalidation(
+                {"pre_entry_invalidation_price": price,
+                 "pre_entry_invalidation_type": invalidation_type},
+                bar,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SchemaValidationError(str(exc)) from exc
 
     @staticmethod
     def _invalidate_before_entry(outcome: dict[str, Any], timestamp: datetime, bar: dict[str, Any]) -> None:

@@ -251,7 +251,8 @@ def validate_state_shape(state: Any, expected_date: str | None = None) -> None:
                 if key in item:
                     _aware(item[key], f"event {key}")
     for event in state["schedule_events"]:
-        if event.get("status") not in {"SKIPPED_STALE", "SKIPPED_CUTOFF", "EOD_STARTED"}:
+        if event.get("status") not in {"SKIPPED_STALE", "SKIPPED_CUTOFF", "SKIPPED_PRIMARY_ENTRY_TRIGGERED",
+                                       "SUPPRESSED_ACTIVE_PLAN", "EOD_STARTED"}:
             raise StateCorruptionError("Invalid schedule-event status")
     _finite_tree(state)
 

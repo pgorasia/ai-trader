@@ -173,3 +173,27 @@ def record_ai_success(state: dict[str, Any]) -> None:
     ensure_controls(state)
     if state["ai_circuit"]["status"] != "OPEN":
         state["ai_circuit"]["consecutive_failures"] = 0
+
+
+def complete_eod_recovery(state: dict[str, Any], now: datetime, review: dict[str, Any]) -> None:
+    """Persist an idempotent local EOD transition while retaining AI failure evidence."""
+    from .lifecycle import completed_eod_operation_id
+
+    already_completed = completed_eod_operation_id(state) is not None
+    operation_id = f"eod-recovery:{state['session_date']}"
+    record = operation(state, operation_id)
+    if record is None:
+        record = prepare(state, operation_id, "EOD_RECOVERY", now, 1)
+        start(record, now)
+        complete(record, now)
+    elif record.get("state") != "COMPLETED":
+        raise ValueError("EOD recovery operation is not safely idempotent")
+    if operation_id not in state["operation_ids"]:
+        state["operation_ids"].append(operation_id)
+    counts = state.setdefault("usage_counts", {})
+    # A bare/contradictory boolean is not completion provenance.  Recovery
+    # still records the one real transition and repairs the counters.
+    if not already_completed:
+        counts["eod_runs"] = int(counts.get("eod_runs", 0)) + 1
+        counts["eod_completed_runs"] = int(counts.get("eod_completed_runs", 0)) + 1
+    state.update({"eod_completed": True, "eod_review": review, "session_terminal": True})

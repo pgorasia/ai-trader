@@ -36,9 +36,10 @@ from trader.shadow_monitor import ShadowPlanMonitor, aggregate_completed_15m, va
 from trader.state import STRATEGY_VERSION, StateStore, initial_state
 from trader.automation import DaemonSupervisor, Heartbeat, health_check
 from trader.job_contracts import JOB_TOOL_CONTRACTS, validate_job_contracts
+from trader.lifecycle import scheduler_decision
 from trader.operations import (complete as complete_operation, eligible as operation_eligible,
     ensure_controls, fail as fail_operation, operation as find_operation, prepare as prepare_operation,
-    failure_counts_now, record_ai_failure, record_ai_success, start as start_operation)
+    complete_eod_recovery, failure_counts_now, record_ai_failure, record_ai_success, start as start_operation)
 from trader.shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, locate_codex_config, verify_shadow_mcp_boundary
 
 
@@ -47,7 +48,7 @@ CONFIG_PATH = ROOT / "config" / "strategy.yaml"
 LOGGER = logging.getLogger("ai_trader")
 BASELINE_STRATEGY_SHA256 = "0f7872c6530cfcda472f09c4509822da9a8d09f6177243ab6b3b36ab4326c4bc"
 ACCEPTANCE_VERSION = 1
-RELIABILITY_SCENARIOS = tuple(range(1, 51))
+RELIABILITY_SCENARIOS = tuple(range(1, 1041))
 
 
 def audit(event: str, **values: Any) -> None:
@@ -392,7 +393,7 @@ class ShadowOrchestrator:
         write_json_companion(self.root / "reports" / f"{state['session_date']}-cycle-{cycle_number}.json", cycle)
         if cycle["sol_escalation"]:
             if self._trusted_now() >= session.latest_entry:
-                state["schedule_events"].append({"operation_id": f"sol-skip:{cycle_id}", "status": "SKIPPED_CUTOFF", "scheduled_for": scheduled_for.isoformat(), "observed_at": self._trusted_now().isoformat()})
+                state["schedule_events"].append({"operation_id": f"sol-skip:{cycle_id}", "status": "SKIPPED_CUTOFF", "reason_code": "LATEST_ENTRY_CUTOFF", "scheduled_for": scheduled_for.isoformat(), "observed_at": self._trusted_now().isoformat()})
                 state["operation_ids"].append(f"sol-skip:{cycle_id}")
                 self.store.save(state)
             else:
@@ -407,6 +408,7 @@ class ShadowOrchestrator:
             state["schedule_events"].append({
                 "operation_id": operation_id,
                 "status": "SKIPPED_PRIMARY_ENTRY_TRIGGERED",
+                "reason_code": "PRIMARY_ENTERED_ONE_ENTRY_LOCK",
                 "scheduled_for": scheduled_for.isoformat(),
                 "observed_at": self._trusted_now().isoformat(),
             })
@@ -708,9 +710,8 @@ class ShadowOrchestrator:
                                       "ai_failures": state.get("ai_circuit", {}).get("failure_count", 0)},
                   "metrics_retained": True,
                   "ai_eod_outcome": "FAILED_TERMINAL" if ai_failed else "NOT_COMPLETED"}
-        state.update({"eod_completed": True, "eod_review": review, "session_terminal": True})
-        if operation_id not in state["operation_ids"]: state["operation_ids"].append(operation_id)
-        self.store.save(state); audit("SESSION_COMPLETE", eod=status)
+        complete_eod_recovery(state, self._trusted_now(), review)
+        self.store.save(state); audit("SESSION_COMPLETE", session=state["session_date"], eod=status)
         return {"session_date": state["session_date"], "agent_review": review,
                 "shadow_plans": state["shadow_plans"], "completed_shadow_trades": state["completed_shadow_trades"],
                 "research_outcomes": state.get("research_outcomes", []), "readiness": state.get("readiness")}
@@ -759,7 +760,7 @@ class ShadowOrchestrator:
         for slot in stale_initial:
             operation_id = f"stale-slot:{slot.isoformat()}"
             if operation_id not in state["operation_ids"]:
-                state["schedule_events"].append({"operation_id": operation_id, "status": "SKIPPED_STALE", "scheduled_for": slot.isoformat(), "observed_at": current.isoformat()})
+                state["schedule_events"].append({"operation_id": operation_id, "status": "SKIPPED_STALE", "reason_code": "SCAN_SLOT_STALE", "scheduled_for": slot.isoformat(), "observed_at": current.isoformat()})
                 state["operation_ids"].append(operation_id)
                 audit("STALE_SLOT_MARKED", scheduled_for=slot.isoformat())
         if stale_initial:
@@ -776,6 +777,19 @@ class ShadowOrchestrator:
             try:
                 if self._active_plan_count(state):
                     self.monitor_active_plans(state, self._trusted_now())
+                if self._active_plan_count(state) and event_time in scan_slots:
+                    operation_id = f"scan-suppressed:{event_time.isoformat()}"
+                    if operation_id not in state["operation_ids"]:
+                        decision = scheduler_decision(
+                            state["shadow_plans"], self._trusted_now(), scanner_due=True)
+                        state["schedule_events"].append({
+                            "operation_id": operation_id,
+                            "status": "SUPPRESSED_ACTIVE_PLAN",
+                            "reason_code": decision["reason_code"],
+                            "scheduled_for": event_time.isoformat(),
+                            "observed_at": self._trusted_now().isoformat(),
+                        })
+                        state["operation_ids"].append(operation_id)
                 # A terminal unentered plan releases this scheduled scan. An
                 # OPEN or still-PENDING plan continues to own the slot.
                 if not self._active_plan_count(state) and event_time in scan_slots and event_time < session.latest_entry:
@@ -783,7 +797,7 @@ class ShadowOrchestrator:
                     if self.scheduler.is_stale(event_time, actual):
                         operation_id = f"stale-slot:{event_time.isoformat()}"
                         if operation_id not in state["operation_ids"]:
-                            state["schedule_events"].append({"operation_id": operation_id, "status": "SKIPPED_STALE", "scheduled_for": event_time.isoformat(), "observed_at": actual.isoformat()})
+                            state["schedule_events"].append({"operation_id": operation_id, "status": "SKIPPED_STALE", "reason_code": "SCAN_SLOT_STALE", "scheduled_for": event_time.isoformat(), "observed_at": actual.isoformat()})
                             state["operation_ids"].append(operation_id)
                             audit("STALE_SLOT_MARKED", scheduled_for=event_time.isoformat())
                             self.store.save(state)

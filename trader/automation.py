@@ -16,6 +16,7 @@ from .market_calendar import ET
 from .codex_events import sanitize_diagnostic_text
 from .maintenance import LocalMaintenanceController
 from .models import TraderError
+from .operations import complete_eod_recovery
 from .state import atomic_write_json, validate_state_shape
 
 HEARTBEAT_SCHEMA_VERSION = 1
@@ -268,20 +269,20 @@ class DaemonSupervisor:
         else:
             status = "POST_CLOSE_RECOVERY_FINALIZED"
             state["post_close_recovery_state"] = status
-        state["eod_completed"] = True
-        state["session_terminal"] = True
         terminal_eod = next((item for item in state.get("ai_operations", [])
                              if item.get("operation_type") == "EOD"
                              and item.get("state") == "FAILED_TERMINAL"), None)
         if terminal_eod:
             status = "POST_CLOSE_RECOVERY_FINALIZED_AFTER_AI_FAILURE"
             state["post_close_recovery_state"] = status
-        state["eod_review"] = {"session_date": session.session_date, "status": status,
+        review = {"session_date": session.session_date, "status": status,
                                "metrics_retained": True, "recovery_reason": "STARTED_AFTER_MARKET_CLOSE",
                                "ai_eod_outcome": ("FAILED_TERMINAL" if terminal_eod else
                                                   "NOT_STARTED_PREFLIGHT_FAILED" if failed_preflight else
                                                   "NOT_COMPLETED")}
+        complete_eod_recovery(state, now, review)
         self.orchestrator.store.save(state)
+        _audit("SESSION_COMPLETE", session=session.session_date, eod=status)
         next_session = self.calendar.next_session(session.eod_time + timedelta(seconds=1))
         next_action = self._preflight_at(next_session)
         _audit("WAITING_FOR_NEXT_SESSION", session=next_session.session_date)
