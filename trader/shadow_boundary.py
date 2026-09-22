@@ -11,6 +11,18 @@ from .models import ConfigurationError, PreflightError
 
 
 SHADOW_TOOL_POLICY_VERSION = "shadow-robinhood-readonly-v1"
+HOST_POLICY_VERSION = "codex-host-tool-boundary-v1"
+DEFAULT_HOST_REQUIREMENTS_PATH = Path("/etc/codex/requirements.toml")
+ROBINHOOD_MCP_SERVER = "robinhood-trading"
+ROBINHOOD_MCP_IDENTITY_URL = "https://agent.robinhood.com/mcp/trading"
+REQUIRED_DISABLED_HOST_FEATURES = frozenset({
+    "apps",
+    "plugins",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+})
 
 # This is the complete, reviewed Robinhood surface permitted by policy version v1.
 # A configured set may be a subset, but no name outside this set is authorized.
@@ -54,6 +66,45 @@ class ShadowBoundaryResult:
     server_name: str
     enabled_tools: frozenset[str]
     policy_version: str = SHADOW_TOOL_POLICY_VERSION
+
+
+@dataclass(frozen=True)
+class HostPolicyResult:
+    requirements_path: Path
+    server_name: str = ROBINHOOD_MCP_SERVER
+    identity_url: str = ROBINHOOD_MCP_IDENTITY_URL
+    policy_version: str = HOST_POLICY_VERSION
+
+
+def verify_host_policy(requirements_path: Path = DEFAULT_HOST_REQUIREMENTS_PATH) -> HostPolicyResult:
+    """Verify the administrator-enforced Codex boundary before model execution."""
+    path = Path(requirements_path).expanduser().resolve(strict=False)
+    try:
+        config = tomllib.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise PreflightError(f"Codex host requirements are missing at {path}") from exc
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise PreflightError(f"Cannot parse Codex host requirements at {path}: {type(exc).__name__}") from exc
+
+    features = config.get("features")
+    if not isinstance(features, dict):
+        raise PreflightError("Codex host requirements have no features mapping")
+    enabled = sorted(name for name in REQUIRED_DISABLED_HOST_FEATURES if features.get(name) is not False)
+    if enabled:
+        raise PreflightError("Codex host requirements do not disable required integrations: " + ", ".join(enabled))
+
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict) or set(servers) != {ROBINHOOD_MCP_SERVER}:
+        observed = sorted(str(name) for name in servers) if isinstance(servers, dict) else []
+        raise PreflightError(
+            "Codex host MCP allowlist must contain only robinhood-trading; found: "
+            + (", ".join(observed) if observed else "none")
+        )
+    server = servers[ROBINHOOD_MCP_SERVER]
+    identity = server.get("identity") if isinstance(server, dict) else None
+    if not isinstance(identity, dict) or identity.get("url") != ROBINHOOD_MCP_IDENTITY_URL:
+        raise PreflightError("Codex host Robinhood MCP identity URL does not match the production endpoint")
+    return HostPolicyResult(path)
 
 
 def normalize_configured_tool_name(value: Any) -> str:

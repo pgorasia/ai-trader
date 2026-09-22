@@ -145,6 +145,10 @@ class SafetySchemaStateTests(unittest.TestCase):
         self.assertIn("multi_agent_v2", luna)
         self.assertIn("shell_tool", luna)
         self.assertIn("shell_tool", sol)
+        self.assertIn("features.apps=false", luna)
+        self.assertIn("features.plugins=false", luna)
+        self.assertIn("features.apps=false", sol)
+        self.assertIn("features.plugins=false", sol)
 
     @staticmethod
     def good_preflight():

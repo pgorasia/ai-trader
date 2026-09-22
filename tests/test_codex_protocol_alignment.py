@@ -191,6 +191,24 @@ class CodexProtocolAlignmentTests(unittest.TestCase):
         ]
         self.assert_job_fails(lifecycle(extra=extra))
 
+    def test_sites_and_unapproved_app_plugin_namespaces_fail_before_acceptance(self):
+        for tool in ("sites.add_custom_domain", "sites.read_domain", "app.invoke", "plugin.execute"):
+            extra = [
+                {"type": "item.started", "item": {"id": "foreign", "type": "function_call", "name": tool}},
+                {"type": "item.completed", "item": {"id": "foreign", "type": "function_call", "name": tool}},
+            ]
+            with self.subTest(tool=tool), self.assertRaises(CodexRunError):
+                self.run_job(lifecycle(extra=extra))
+
+    def test_foreign_mcp_namespace_cannot_complete_acceptance(self):
+        extra = [
+            {"type": "item.started", "item": {"id": "foreign", "type": "mcp_tool_call",
+             "server": "sites", "tool": "read_domain"}},
+            {"type": "item.completed", "item": {"id": "foreign", "type": "mcp_tool_call"}},
+        ]
+        with self.assertRaisesRegex(CodexRunError, "non-Robinhood server"):
+            self.run_job(lifecycle(extra=extra))
+
     def test_unknown_security_relevant_item_fails_closed(self):
         extra = [{"type": "item.completed", "item": {"id": "x1", "type": "future_tool_execution"}}]
         self.assert_job_fails(lifecycle(extra=extra))

@@ -93,10 +93,16 @@ def main() -> int:
                   "Preserve SHADOW-only behavior, all strategy/risk thresholds, and the read-only tool boundary. "
                   "Do not access Robinhood. Run the full unit suite after repair.\n" + json.dumps(evidence, sort_keys=True))
         clean_home = work / "codex-home"; clean_home.mkdir()
+        (clean_home / "config.toml").write_text(
+            '[features]\napps = false\nplugins = false\nbrowser_use = false\n'
+            'browser_use_external = false\nbrowser_use_full_cdp_access = false\ncomputer_use = false\n'
+            '[mcp_servers.robinhood-trading]\nenabled = false\n', encoding="utf-8")
         environment = {key: value for key, value in os.environ.items() if key not in {"OPENAI_API_KEY", "CODEX_HOME"}}
         environment["CODEX_HOME"] = str(clean_home)
         before = args.parent
-        invoked = subprocess.run(["codex", "exec", "--model", "gpt-5.6-sol", "--sandbox", "workspace-write", prompt],
+        invoked = subprocess.run(["codex", "exec", "--model", "gpt-5.6-sol", "--sandbox", "workspace-write",
+                                  "--config", "features.apps=false", "--config", "features.plugins=false",
+                                  "--config", "mcp_servers.robinhood-trading.enabled=false", prompt],
                                  cwd=clone, env=environment, check=False, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, timeout=1800)
         after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=clone, text=True, stdout=subprocess.PIPE,

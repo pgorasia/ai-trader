@@ -40,7 +40,8 @@ from trader.lifecycle import scheduler_decision
 from trader.operations import (complete as complete_operation, eligible as operation_eligible,
     ensure_controls, fail as fail_operation, operation as find_operation, prepare as prepare_operation,
     complete_eod_recovery, failure_counts_now, record_ai_failure, record_ai_success, start as start_operation)
-from trader.shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, locate_codex_config, verify_shadow_mcp_boundary
+from trader.shadow_boundary import (APPROVED_SHADOW_ROBINHOOD_TOOLS, DEFAULT_HOST_REQUIREMENTS_PATH,
+    locate_codex_config, verify_host_policy, verify_shadow_mcp_boundary)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -56,13 +57,15 @@ def audit(event: str, **values: Any) -> None:
     LOGGER.info("AI_TRADER event=%s%s", event, f" {fields}" if fields else "")
 
 
-def validate_unattended_config(root: Path = ROOT) -> dict[str, Any]:
+def validate_unattended_config(root: Path = ROOT, *, host_requirements_path: Path = DEFAULT_HOST_REQUIREMENTS_PATH) -> dict[str, Any]:
     """Local-only startup validation: no runner, child process, MCP, or network activity."""
     config = load_config(root / "config" / "strategy.yaml")
     offline_preflight(root, config)
     problems = validate_job_contracts()
     if config.get("mode") != "SHADOW": problems.append("configured mode is not SHADOW")
     if len(APPROVED_SHADOW_ROBINHOOD_TOOLS) != 22: problems.append("global SHADOW tool boundary is not exactly 22 tools")
+    try: host_policy = verify_host_policy(host_requirements_path)
+    except TraderError as exc: problems.append(sanitize_diagnostic_text(str(exc))); host_policy = None
     try: boundary = verify_shadow_mcp_boundary(locate_codex_config(config["codex"]))
     except TraderError as exc: problems.append(sanitize_diagnostic_text(str(exc))); boundary = None
     configured_executable = config["codex"].get("executable", "auto")
@@ -74,7 +77,8 @@ def validate_unattended_config(root: Path = ROOT) -> dict[str, Any]:
             "problems": problems, "required_approvals": sorted(set().union(*JOB_TOOL_CONTRACTS.values())),
             "global_tool_count": len(APPROVED_SHADOW_ROBINHOOD_TOOLS),
             "codex_executable": str(resolved) if resolved else None,
-            "robinhood_server": boundary.server_name if boundary else None}
+            "robinhood_server": boundary.server_name if boundary else None,
+            "host_policy": host_policy.policy_version if host_policy else None}
 
 
 def aware(value: str) -> datetime:

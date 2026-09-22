@@ -13,7 +13,8 @@ from typing import Any
 from .codex_events import CODEX_EVENT_PROTOCOL, parse_codex_jsonl, sanitize_diagnostic_text
 from .codex_executable import codex_child_environment, resolve_codex_executable
 from .models import CodexRunError, CodexRunResult, CodexTimeoutError, DataUnavailableError, ToolExecutionError
-from .shadow_boundary import APPROVED_SHADOW_ROBINHOOD_TOOLS, ShadowBoundaryResult, locate_codex_config, verify_shadow_mcp_boundary
+from .shadow_boundary import (APPROVED_SHADOW_ROBINHOOD_TOOLS, DEFAULT_HOST_REQUIREMENTS_PATH,
+    ShadowBoundaryResult, locate_codex_config, verify_host_policy, verify_shadow_mcp_boundary)
 from .safety import normalize_codex_output, validate_json
 
 TRANSIENT_READ_PATTERNS = re.compile(r"(rate.?limit|temporar(?:y|ily)|service unavailable|connection reset|connection aborted|http 502|http 503)", re.IGNORECASE)
@@ -64,6 +65,7 @@ class CodexRunner:
         self.version = resolved.version
         self.child_environment = codex_child_environment(settings)
         self.codex_config_path = locate_codex_config(settings)
+        self.host_requirements_path = Path(settings.get("host_requirements_path", DEFAULT_HOST_REQUIREMENTS_PATH))
         self.timeout_seconds = int(settings.get("timeout_seconds", 240))
         self.transient_retries = int(settings.get("transient_read_retries", 1))
         self.retry_backoff = float(settings.get("retry_backoff_seconds", 2))
@@ -103,6 +105,14 @@ class CodexRunner:
         if robinhood_enabled_tools is not None:
             override = build_robinhood_enabled_tools_override(self._shadow_boundary.server_name, robinhood_enabled_tools)
             command.extend(["--config", override])
+        command.extend([
+            "--config", "features.apps=false",
+            "--config", "features.plugins=false",
+            "--config", "features.browser_use=false",
+            "--config", "features.browser_use_external=false",
+            "--config", "features.browser_use_full_cdp_access=false",
+            "--config", "features.computer_use=false",
+        ])
         if not allow_web:
             command.extend(["--disable", "browser_use", "--disable", "browser_use_external", "--disable", "standalone_web_search"])
         command.append("-")
@@ -111,6 +121,10 @@ class CodexRunner:
     def run(self, *, prompt_path: Path, schema_path: Path, model: str, context: dict[str, Any], required_robinhood_tools: frozenset[str], allow_web: bool = False, reasoning_effort: str | None = None, exact_robinhood_tools: bool = False, expected_robinhood_arguments: dict[str, dict[str, Any]] | None = None, robinhood_enabled_tools: frozenset[str] | None = None, disable_all_mcp: bool = False, working_directory: Path | None = None, maximum_robinhood_tool_calls: dict[str, int] | None = None, require_web_search: bool = False) -> CodexRunResult:
         if not hasattr(self, "_shadow_boundary"):
             raise CodexRunError("Deterministic SHADOW MCP boundary was not verified at startup")
+        # Re-read the administrator policy immediately before every production
+        # child launch so drift after startup cannot reach a trading Codex turn.
+        if hasattr(self, "_host_policy"):
+            verify_host_policy(self._host_policy.requirements_path)
         if disable_all_mcp and (required_robinhood_tools or robinhood_enabled_tools is not None):
             raise CodexRunError("MCP-disabled jobs cannot require or expose Robinhood tools")
         if require_web_search and not allow_web:
@@ -350,6 +364,7 @@ class CodexRunner:
         ]
 
     def verify_shadow_boundary(self) -> ShadowBoundaryResult:
+        self._host_policy = verify_host_policy(self.host_requirements_path)
         self._shadow_boundary = verify_shadow_mcp_boundary(self.codex_config_path)
         return self._shadow_boundary
 

@@ -435,7 +435,10 @@ def isolated_codex_environment(worktree: Path, base_env: dict[str, str] | None =
     source = os.environ if base_env is None else base_env
     codex_home = Path(tempfile.mkdtemp(prefix="ai-trader-maintenance-codex-", dir="/tmp"))
     (codex_home / "config.toml").write_text(
-        'approval_policy = "never"\nsandbox_mode = "workspace-write"\n', encoding="utf-8"
+        'approval_policy = "never"\nsandbox_mode = "workspace-write"\n'
+        '[features]\napps = false\nplugins = false\nbrowser_use = false\n'
+        'browser_use_external = false\nbrowser_use_full_cdp_access = false\ncomputer_use = false\n',
+        encoding="utf-8"
     )
     env = {key: value for key, value in source.items()
            if key not in {"OPENAI_API_KEY", "ROBINHOOD_OAUTH", "ROBINHOOD_TOKEN"}}
@@ -465,6 +468,8 @@ def invoke_maintenance_codex(worktree: Path, queue: dict[str, Any], *,
         command = [
             executable, "exec", "--sandbox", "workspace-write", "--cd", str(worktree),
             "--ephemeral", "--disable", "multi_agent", "--disable", "multi_agent_v2",
+            "--config", "features.apps=false", "--config", "features.plugins=false",
+            "--config", "mcp_servers.robinhood-trading.enabled=false",
             "--disable", "browser_use", "--disable", "browser_use_external",
             "--disable", "standalone_web_search", "--json", "-",
         ]
