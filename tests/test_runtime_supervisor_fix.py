@@ -11,7 +11,7 @@ import unittest
 
 from tools.install_runtime_supervisor import install
 from tools.runtime_audit import _liveness
-from tools.runtime_supervisor import RuntimeSupervisor
+from tools.runtime_supervisor import RuntimeSupervisor, parser as supervisor_parser, supervisor_arguments
 
 
 HEAD = "a" * 40
@@ -84,6 +84,10 @@ class RuntimeSupervisorPolicyTests(unittest.TestCase):
         self.assertEqual(status, 7)
         self.assertTrue(any(" stop " in f" {x} " for x in flat))
         self.assertTrue(any("self_heal_repair.py" in x for x in flat))
+        repair = next(x for x in commands.calls if "self_heal_repair.py" in " ".join(x))
+        self.assertIn("--parent", repair)
+        self.assertEqual(repair[repair.index("--parent") + 1], HEAD)
+        self.assertIn("--output", repair)
 
     def test_safety_stops_and_repairs(self):
         commands = FakeCommands(repair=8)
@@ -167,32 +171,43 @@ class SupervisorInstallTests(unittest.TestCase):
     def test_source_controlled_install_to_injected_root(self):
         repo = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
-            installed = install(repo, Path(directory), production_repo=Path("/srv/ai-trader"),
-                                python=Path("/venv/bin/python"))
+            installed = install(repo, Path(directory), production_repo=repo,
+                                python=Path(sys.executable))
             wrapper = installed[0].read_text()
             self.assertTrue(all(path.is_file() for path in installed))
-            self.assertIn("/srv/ai-trader/tools/runtime_supervisor.py", wrapper)
+            self.assertIn(str(repo / "tools/runtime_supervisor.py"), wrapper)
             self.assertTrue(os.stat(installed[0]).st_mode & 0o100)
             self.assertIn("ExecStart=/usr/local/bin/ai-trader-supervisor-run", installed[1].read_text())
 
     def test_canonical_production_repo_cli_remains_supported(self):
+        repo = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
-            result = self.invoke_installer(directory, "--production-repo", "/srv/canonical",
-                                           "--python", "/venv/bin/python")
+            result = self.invoke_installer(directory, "--production-repo", str(repo),
+                                           "--python", sys.executable)
             self.assertEqual(result.returncode, 0, result.stderr)
             wrapper = (Path(directory) / "usr/local/bin/ai-trader-supervisor-run").read_text()
-            self.assertIn("/srv/canonical/tools/runtime_supervisor.py", wrapper)
+            self.assertIn(str(repo / "tools/runtime_supervisor.py"), wrapper)
 
     def test_repo_alias_and_install_flag_are_supported(self):
+        repo = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
-            result = self.invoke_installer(directory, "--repo", "/srv/compatibility",
-                                           "--python", "/venv/bin/python", "--install")
+            result = self.invoke_installer(directory, "--repo", str(repo),
+                                           "--python", sys.executable, "--install")
             self.assertEqual(result.returncode, 0, result.stderr)
-            repeated = self.invoke_installer(directory, "--repo", "/srv/compatibility",
-                                             "--python", "/venv/bin/python", "--install")
+            repeated = self.invoke_installer(directory, "--repo", str(repo),
+                                             "--python", sys.executable, "--install")
             self.assertEqual(repeated.returncode, 0, repeated.stderr)
             wrapper = (Path(directory) / "usr/local/bin/ai-trader-supervisor-run").read_text()
-            self.assertIn("/srv/compatibility/tools/runtime_supervisor.py", wrapper)
+            self.assertIn(str(repo / "tools/runtime_supervisor.py"), wrapper)
+
+    def test_generated_supervisor_contract_and_safe_startup_self_test(self):
+        repo = Path(__file__).resolve().parents[1]
+        arguments = supervisor_arguments(repo=repo, python=sys.executable)
+        parsed = supervisor_parser().parse_args([*arguments, "--self-test"])
+        self.assertTrue(parsed.self_test)
+        completed = subprocess.run([sys.executable, str(repo / "tools/runtime_supervisor.py"),
+                                    *arguments, "--self-test"], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_conflicting_repo_arguments_fail_clearly(self):
         with tempfile.TemporaryDirectory() as directory:

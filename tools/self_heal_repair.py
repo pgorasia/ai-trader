@@ -56,11 +56,15 @@ def prepare_clone(repo: Path, parent: str, destination: Path) -> None:
     if actual != parent: raise RuntimeError("isolated clone parent mismatch")
 
 
-def main() -> int:
+def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(); p.add_argument("--repo", required=True, type=Path)
     p.add_argument("--incident", required=True, type=Path); p.add_argument("--parent", required=True)
     p.add_argument("--output", required=True, type=Path); p.add_argument("--execute", action="store_true")
-    args = p.parse_args()
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
     try: evidence = load_incident(args.incident)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         atomic_write_json(args.output, {"status": "REFUSED", "reason": str(exc)[:240]}); return 20

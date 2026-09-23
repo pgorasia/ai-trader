@@ -20,8 +20,33 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from trader.state import atomic_write_json
+from tools.runtime_audit import parser as runtime_audit_parser
+from tools.self_heal_repair import parser as repair_parser
 
 PASSIVE_EXITS = frozenset({0, 10, 20})
+
+
+def runtime_audit_command(*, python: str, repo: Path, state_dir: Path,
+                          journal_file: Path, output: Path) -> list[str]:
+    """Canonical runtime-auditor launch contract."""
+    return [python, str(repo / "tools/runtime_audit.py"), "--repo", str(repo),
+            "--state-dir", str(state_dir), "--journal-file", str(journal_file),
+            "--output", str(output)]
+
+
+def supervisor_arguments(*, repo: Path, python: str) -> list[str]:
+    """Canonical arguments shared by the installer and supervisor parser."""
+    return ["--repo", str(repo), "--state-dir", str(repo / "state"),
+            "--journal-file", "/var/lib/ai-trader-supervisor/trader-journal.log",
+            "--runtime-dir", "/var/lib/ai-trader-supervisor", "--python", python]
+
+
+def repair_command(*, python: str, repo: Path, incident: Path,
+                   parent: str, output: Path) -> list[str]:
+    """Canonical self-healing launch contract."""
+    return [python, str(repo / "tools/self_heal_repair.py"), "--repo", str(repo),
+            "--incident", str(incident), "--parent", parent, "--output", str(output),
+            "--execute"]
 
 
 def incident_fingerprint(audit: dict) -> str:
@@ -59,9 +84,8 @@ class RuntimeSupervisor:
             value = self.audit_func()
             atomic_write_json(output, value)
             return value
-        completed = self.run([self.python, str(self.repo / "tools/runtime_audit.py"),
-            "--repo", str(self.repo), "--state-dir", str(self.state_dir),
-            "--journal-file", str(self.journal_file), "--output", str(output)], check=False)
+        completed = self.run(runtime_audit_command(python=self.python, repo=self.repo,
+            state_dir=self.state_dir, journal_file=self.journal_file, output=output), check=False)
         try:
             value = json.loads(output.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -120,10 +144,9 @@ class RuntimeSupervisor:
         if not self._repair_allowed(audit):
             return 42
         output = incident / "repair-result.json"
-        return self.run([self.python, str(self.repo / "tools/self_heal_repair.py"),
-            "--repo", str(self.repo), "--incident", str(incident / "incident.json"),
-            "--parent", str(audit.get("head", "")), "--output", str(output), "--execute"],
-            check=False).returncode
+        return self.run(repair_command(python=self.python, repo=self.repo,
+            incident=incident / "incident.json", parent=str(audit.get("head", "")),
+            output=output), check=False).returncode
 
     def execute(self) -> int:
         with self._lock() as acquired:
@@ -164,7 +187,7 @@ class RuntimeSupervisor:
             return 42
 
 
-def main() -> int:
+def parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--state-dir", required=True, type=Path)
@@ -173,7 +196,31 @@ def main() -> int:
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--service", default="ai-trader.service")
     parser.add_argument("--confirmation-seconds", type=int, default=30)
-    args = parser.parse_args()
+    parser.add_argument("--self-test", action="store_true")
+    return parser
+
+
+def self_test(args: argparse.Namespace) -> int:
+    """Validate launch contracts and local entrypoints without running an audit."""
+    if not args.repo.is_dir() or not Path(args.python).is_file():
+        return 2
+    if not (args.repo / "tools/runtime_audit.py").is_file():
+        return 2
+    audit_args = runtime_audit_command(python=args.python, repo=args.repo,
+        state_dir=args.state_dir, journal_file=args.journal_file,
+        output=args.runtime_dir / "self-test-audit.json")[2:]
+    runtime_audit_parser().parse_args(audit_args)
+    repair_args = repair_command(python=args.python, repo=args.repo,
+        incident=args.runtime_dir / "self-test-incident.json", parent="0" * 40,
+        output=args.runtime_dir / "self-test-repair.json")[2:]
+    repair_parser().parse_args(repair_args)
+    return 0
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.self_test:
+        return self_test(args)
     return RuntimeSupervisor(repo=args.repo, state_dir=args.state_dir, journal_file=args.journal_file,
         runtime_dir=args.runtime_dir, python=args.python, service=args.service,
         confirmation_seconds=args.confirmation_seconds).execute()

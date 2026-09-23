@@ -181,11 +181,16 @@ def audit(repo: Path, state_dir: Path, journal_file: Path, *, now: datetime | No
             "latest_session_complete": bool(latest_state and latest_state.get("eod_completed"))}
 
 
-def main() -> int:
+def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(); p.add_argument("--repo", required=True, type=Path)
     p.add_argument("--state-dir", required=True, type=Path); p.add_argument("--journal-file", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path); p.add_argument("--remediate", action="store_true")
-    p.add_argument("--service", default="ai-trader.service"); args = p.parse_args()
+    p.add_argument("--service", default="ai-trader.service")
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
     result = audit(args.repo, args.state_dir, args.journal_file)
     if args.remediate and result["remediation"]["action"] == "RESTART_SERVICE":
         completed = subprocess.run(["systemctl", "restart", args.service], check=False,
