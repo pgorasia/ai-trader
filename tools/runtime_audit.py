@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
@@ -19,6 +20,52 @@ from trader.runtime_supervision import classify, remediation_decision, update_st
 from trader.state import atomic_write_json
 
 REQUIRED_ACCEPTANCE_COUNTS = {"preflight": 5, "luna_schema": 5, "eod": 3}
+DEFAULT_HEARTBEAT_SECONDS = 60
+DEFAULT_MISSED_HEARTBEATS = 3
+DEFAULT_OPERATION_GRACE_SECONDS = 30
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _liveness(repo: Path, heartbeat: dict, latest_state: dict | None,
+              observed: datetime) -> tuple[str, dict]:
+    """Classify daemon liveness using its configured cadence and operation deadline."""
+    stamp = datetime.fromisoformat(str(heartbeat["timestamp"]).replace("Z", "+00:00"))
+    pid = int(heartbeat["daemon_pid"])
+    age = (observed.astimezone(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds()
+    if not _process_alive(pid):
+        return "DEAD_PROCESS", {"heartbeat_age_seconds": age, "daemon_pid": pid}
+    try:
+        config = yaml.safe_load((repo / "config/strategy.yaml").read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeError, yaml.YAMLError):
+        config = {}
+    supervision = config.get("supervision", {})
+    heartbeat_seconds = max(1, int(supervision.get("heartbeat_seconds", DEFAULT_HEARTBEAT_SECONDS)))
+    missed = max(2, int(supervision.get("missed_heartbeats", DEFAULT_MISSED_HEARTBEATS)))
+    idle_deadline = heartbeat_seconds * missed
+    active = None
+    if latest_state:
+        active = next((item for item in reversed(latest_state.get("ai_operations", []))
+                       if item.get("state") == "STARTED" and item.get("started_at")), None)
+    if active:
+        started = datetime.fromisoformat(str(active["started_at"]).replace("Z", "+00:00"))
+        elapsed = (observed.astimezone(timezone.utc) - started.astimezone(timezone.utc)).total_seconds()
+        configured_timeout = max(1, int(config.get("codex", {}).get("timeout_seconds", 240)))
+        grace = max(0, int(supervision.get("operation_grace_seconds", DEFAULT_OPERATION_GRACE_SECONDS)))
+        deadline = configured_timeout + grace
+        detail = {"heartbeat_age_seconds": age, "operation_id": active.get("operation_id"),
+                  "operation_type": active.get("operation_type"),
+                  "operation_elapsed_seconds": elapsed, "operation_deadline_seconds": deadline}
+        return ("ACTIVE_OPERATION" if elapsed <= deadline else "STALE_HEARTBEAT"), detail
+    return ("IDLE_HEALTHY" if age <= idle_deadline else "STALE_HEARTBEAT"), {
+        "heartbeat_age_seconds": age, "idle_deadline_seconds": idle_deadline,
+    }
 
 
 def git_head(repo: Path) -> str | None:
@@ -81,14 +128,15 @@ def audit(repo: Path, state_dir: Path, journal_file: Path, *, now: datetime | No
             findings.append({"code": "STATE_UNREADABLE", "severity": "INTERNAL", "detail": type(exc).__name__})
 
     heartbeat = None
+    liveness = "DEAD_PROCESS"
+    liveness_detail: dict = {}
     try:
         heartbeat = json.loads((state_dir / "heartbeat.json").read_text(encoding="utf-8"))
-        stamp = datetime.fromisoformat(heartbeat["timestamp"].replace("Z", "+00:00"))
-        if (observed.astimezone(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds() > 180:
-            findings.append({"code": "SCHEDULER_SILENCE", "severity": "INTERNAL", "detail": "heartbeat older than 180 seconds"})
-        pid = int(heartbeat["daemon_pid"])
-        try: os.kill(pid, 0)
-        except (OSError, ProcessLookupError):
+        liveness, liveness_detail = _liveness(repo, heartbeat, latest_state, observed)
+        if liveness == "STALE_HEARTBEAT":
+            findings.append({"code": "SCHEDULER_SILENCE", "severity": "INTERNAL",
+                             "detail": "heartbeat exceeded its configured liveness deadline"})
+        elif liveness == "DEAD_PROCESS":
             findings.append({"code": "SERVICE_INACTIVE", "severity": "INTERNAL", "detail": "heartbeat PID is not alive"})
         if not heartbeat.get("lifecycle_state"):
             findings.append({"code": "SCHEDULER_REASON_MISSING", "severity": "INTERNAL", "detail": "heartbeat lacks lifecycle reason"})
@@ -125,10 +173,12 @@ def audit(repo: Path, state_dir: Path, journal_file: Path, *, now: datetime | No
     restart = remediation_decision(service_inactive=any(x["code"] == "SERVICE_INACTIVE" for x in findings),
         session_active=session_active, accepted=accepted == head and head is not None, acceptance_valid=acceptance_valid,
         safety_defect=exit_code == 43)
-    return {"version": 1, "observed_at": observed.isoformat(), "head": head, "accepted_commit": accepted,
+    return {"version": 2, "observed_at": observed.isoformat(), "head": head, "accepted_commit": accepted,
             "findings": findings, "classification": {0: "HEALTHY", 10: "EXTERNAL_DEGRADED", 20: "NOT_ACTIONABLE",
                 42: "INTERNAL_DEFECT", 43: "SAFETY_DEFECT"}[exit_code], "exit_code": exit_code,
-            "remediation": restart, "latest_session_complete": bool(latest_state and latest_state.get("eod_completed"))}
+            "remediation": restart, "liveness": {"state": liveness if heartbeat else "DEAD_PROCESS",
+                **(liveness_detail if heartbeat else {})},
+            "latest_session_complete": bool(latest_state and latest_state.get("eod_completed"))}
 
 
 def main() -> int:

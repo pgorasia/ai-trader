@@ -1,0 +1,12 @@
+[Unit]
+Description=Audit AI Trader every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=20s
+Persistent=true
+Unit=ai-trader-supervisor.service
+
+[Install]
+WantedBy=timers.target

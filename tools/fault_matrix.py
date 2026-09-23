@@ -18,7 +18,8 @@ from trader.lifecycle import (evaluate_entry_cutoff, evaluate_entry_trigger,
     evaluate_time_exit, evaluate_trailing_stop, reconcile_plan_state, scheduler_decision,
     session_invariants, transition_plan)
 from trader.state import atomic_write_json, initial_state
-from trader.runtime_supervision import classify_failure
+from trader.runtime_supervision import classify_failure, remediation_decision
+from tools.runtime_supervisor import incident_fingerprint
 
 NOW = datetime.fromisoformat("2026-08-14T10:00:00-04:00")
 
@@ -52,7 +53,9 @@ NAMES = [
  "rejection followed by materially new setup identity", "terminal plan attempting resurrection",
  "second entered PRIMARY attempt", "accepted commit mismatch", "foreign MCP activity",
  "malformed model output", "malformed OHLC", "stale quote", "duplicate finalist",
- "scheduler suppression with explicit reason", "scheduler suppression without reason"]
+ "scheduler suppression with explicit reason", "scheduler suppression without reason",
+ "internal NONE preserves live service", "accepted inactive service selects deterministic restart",
+ "safety defect selects fail-closed repair", "unchanged supervisor incident fingerprint"]
 
 
 def named_case(index: int, name: str) -> dict:
@@ -147,6 +150,24 @@ def named_case(index: int, name: str) -> dict:
             state = initial_state("2026-08-14", now=NOW); state["schedule_events"].append({"status": "SUPPRESSED_TEST"})
             passed = any(x["code"] == "SCHEDULER_SUPPRESSION_WITHOUT_REASON" for x in session_invariants(state))
             detail = "reasonless suppression detected by session invariant"
+        elif index == 40:
+            action = remediation_decision(service_inactive=False, session_active=True, accepted=True,
+                acceptance_valid=True, safety_defect=False)["action"]
+            passed = action == "NONE"
+            detail = "live service internal evidence does not infer a stop or restart"
+        elif index == 41:
+            action = remediation_decision(service_inactive=True, session_active=True, accepted=True,
+                acceptance_valid=True, safety_defect=False)["action"]
+            passed = action == "RESTART_SERVICE"
+            detail = "accepted inactive service selects deterministic restart"
+        elif index == 42:
+            passed = classify_failure("FOREIGN_MCP") == "SAFETY"
+            detail = "safety defect remains fail-closed repair eligible"
+        elif index == 43:
+            incident = {"head": "a" * 40, "classification": "INTERNAL_DEFECT",
+                "remediation": {"action": "NONE"}, "findings": [{"code": "SCHEDULER_SILENCE"}]}
+            passed = incident_fingerprint(incident) == incident_fingerprint(dict(incident))
+            detail = "unchanged commit and evidence retain one repair fingerprint"
         elif index == 34:
             passed = evaluate_entry_trigger({**p, "entry_requires_qualitative_confirmation": True}, b) is None
             detail = "malformed or unresolved qualitative output cannot fabricate entry"
