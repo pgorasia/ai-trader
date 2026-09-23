@@ -47,10 +47,18 @@ def install(repo: Path, destination_root: Path, *, production_repo: Path, python
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--destination-root", type=Path, default=Path("/"))
-    parser.add_argument("--production-repo", type=Path, required=True)
+    parser.add_argument("--production-repo", type=Path)
+    parser.add_argument("--repo", type=Path, help="compatibility alias for --production-repo")
     parser.add_argument("--python", type=Path, required=True)
+    parser.add_argument("--install", action="store_true", help="compatibility flag (installation is always performed)")
     args = parser.parse_args()
-    install(ROOT, args.destination_root, production_repo=args.production_repo, python=args.python)
+    if args.production_repo is None and args.repo is None:
+        parser.error("one of --production-repo or --repo is required")
+    if (args.production_repo is not None and args.repo is not None
+            and args.production_repo != args.repo):
+        parser.error("--production-repo and --repo must specify the same path when used together")
+    production_repo = args.production_repo if args.production_repo is not None else args.repo
+    install(ROOT, args.destination_root, production_repo=production_repo, python=args.python)
     return 0
 
 

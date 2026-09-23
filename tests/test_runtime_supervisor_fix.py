@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -155,6 +156,14 @@ class OperationAwareHeartbeatTests(unittest.TestCase):
 
 
 class SupervisorInstallTests(unittest.TestCase):
+    def invoke_installer(self, destination_root, *arguments):
+        repo = Path(__file__).resolve().parents[1]
+        return subprocess.run(
+            [sys.executable, str(repo / "tools/install_runtime_supervisor.py"),
+             "--destination-root", str(destination_root), *arguments],
+            capture_output=True, text=True, check=False,
+        )
+
     def test_source_controlled_install_to_injected_root(self):
         repo = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
@@ -165,6 +174,39 @@ class SupervisorInstallTests(unittest.TestCase):
             self.assertIn("/srv/ai-trader/tools/runtime_supervisor.py", wrapper)
             self.assertTrue(os.stat(installed[0]).st_mode & 0o100)
             self.assertIn("ExecStart=/usr/local/bin/ai-trader-supervisor-run", installed[1].read_text())
+
+    def test_canonical_production_repo_cli_remains_supported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke_installer(directory, "--production-repo", "/srv/canonical",
+                                           "--python", "/venv/bin/python")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            wrapper = (Path(directory) / "usr/local/bin/ai-trader-supervisor-run").read_text()
+            self.assertIn("/srv/canonical/tools/runtime_supervisor.py", wrapper)
+
+    def test_repo_alias_and_install_flag_are_supported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke_installer(directory, "--repo", "/srv/compatibility",
+                                           "--python", "/venv/bin/python", "--install")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            repeated = self.invoke_installer(directory, "--repo", "/srv/compatibility",
+                                             "--python", "/venv/bin/python", "--install")
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            wrapper = (Path(directory) / "usr/local/bin/ai-trader-supervisor-run").read_text()
+            self.assertIn("/srv/compatibility/tools/runtime_supervisor.py", wrapper)
+
+    def test_conflicting_repo_arguments_fail_clearly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke_installer(directory, "--production-repo", "/srv/canonical",
+                                           "--repo", "/srv/different",
+                                           "--python", "/venv/bin/python")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must specify the same path", result.stderr)
+
+    def test_python_remains_required_with_repo_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke_installer(directory, "--repo", "/srv/compatibility")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--python", result.stderr)
 
 
 if __name__ == "__main__":
