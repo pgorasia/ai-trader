@@ -8,10 +8,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from tools.install_runtime_supervisor import install
-from tools.runtime_audit import _liveness
+from tools.runtime_audit import _liveness, _off_hours_idle_healthy, audit as runtime_audit
 from tools.runtime_supervisor import RuntimeSupervisor, parser as supervisor_parser, supervisor_arguments
+from trader.runtime_supervision import update_stability
+from trader.state import atomic_write_json
 
 
 HEAD = "a" * 40
@@ -122,6 +125,21 @@ class OperationAwareHeartbeatTests(unittest.TestCase):
             "codex:\n  timeout_seconds: 240\nsupervision:\n  heartbeat_seconds: 60\n  missed_heartbeats: 3\n  operation_grace_seconds: 30\n")
         return repo
 
+    def audit_repo(self, directory, observed):
+        repo = self.repo(directory)
+        state = repo / "state"
+        state.mkdir()
+        artifact = {"version": 1, "mode": "SHADOW", "offline_gate": "PASS",
+                    "live_read_only_gate": "PASS",
+                    "live_run_counts": {"preflight": 5, "luna_schema": 5, "eod": 3},
+                    "global_shadow_tool_count": 22, "accepted_git_commit": HEAD}
+        (state / "reliability_acceptance.json").write_text(json.dumps(artifact))
+        (state / "heartbeat.json").write_text(json.dumps({
+            "timestamp": (observed - timedelta(minutes=10)).isoformat(),
+            "daemon_pid": os.getpid(), "lifecycle_state": "WAITING_FOR_NEXT_SESSION"}))
+        with patch("tools.runtime_audit.git_head", return_value=HEAD):
+            return runtime_audit(repo, state, repo / "journal.log", now=observed)
+
     def test_active_long_operation_inside_configured_deadline(self):
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as directory:
@@ -157,6 +175,81 @@ class OperationAwareHeartbeatTests(unittest.TestCase):
             status, _ = _liveness(self.repo(directory),
                 {"timestamp": "2026-09-22T15:24:30+00:00", "daemon_pid": os.getpid()}, state, observed)
         self.assertEqual(status, "ACTIVE_OPERATION")
+
+    def test_2am_waiting_stale_live_pid_is_off_hours_idle_healthy(self):
+        observed = datetime.fromisoformat("2026-09-23T06:00:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            status, detail = _liveness(self.repo(directory), {
+                "timestamp": "2026-09-23T05:50:00+00:00", "daemon_pid": os.getpid(),
+                "lifecycle_state": "WAITING_FOR_NEXT_SESSION"}, None, observed)
+        self.assertTrue(_off_hours_idle_healthy(session_active=False,
+            heartbeat={"lifecycle_state": "WAITING_FOR_NEXT_SESSION"}, active_plans=[],
+            liveness=status, liveness_detail=detail))
+
+    def test_2am_audit_has_no_internal_scheduler_silence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.audit_repo(directory,
+                datetime.fromisoformat("2026-09-23T06:00:00+00:00"))
+        self.assertEqual(result["liveness"]["state"], "IDLE_HEALTHY")
+        self.assertNotIn("SCHEDULER_SILENCE", {x["code"] for x in result["findings"]})
+        self.assertEqual(result["exit_code"], 20)
+
+    def test_active_session_audit_retains_internal_scheduler_silence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.audit_repo(directory,
+                datetime.fromisoformat("2026-09-23T14:00:00+00:00"))
+        self.assertIn("SCHEDULER_SILENCE", {x["code"] for x in result["findings"]})
+        self.assertEqual(result["exit_code"], 42)
+
+    def test_active_session_stale_heartbeat_is_not_idle_healthy(self):
+        self.assertFalse(_off_hours_idle_healthy(session_active=True,
+            heartbeat={"lifecycle_state": "WAITING_FOR_NEXT_SESSION"}, active_plans=[],
+            liveness="STALE_HEARTBEAT", liveness_detail={}))
+
+    def test_off_hours_active_plan_never_receives_idle_exemption(self):
+        self.assertFalse(_off_hours_idle_healthy(session_active=False,
+            heartbeat={"lifecycle_state": "WAITING_FOR_NEXT_SESSION"},
+            active_plans=[{"outcome": {"status": "PENDING"}}],
+            liveness="STALE_HEARTBEAT", liveness_detail={}))
+
+    def test_overdue_operation_never_receives_idle_exemption(self):
+        self.assertFalse(_off_hours_idle_healthy(session_active=False,
+            heartbeat={"lifecycle_state": "WAITING_FOR_NEXT_SESSION"}, active_plans=[],
+            liveness="STALE_HEARTBEAT", liveness_detail={"operation_id": "sol:x"}))
+
+
+class StabilityOwnershipTests(unittest.TestCase):
+    def test_atomic_rewrite_preserves_readable_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "self_heal" / "stability.json"
+            update_stability(path, session="2026-09-21", complete=True,
+                internal_defect=False, external_degradation=False, recovery_correct=True,
+                ownership_source=root)
+            first = path.stat()
+            update_stability(path, session="2026-09-22", complete=True,
+                internal_defect=False, external_degradation=False, recovery_correct=True,
+                ownership_source=root)
+            second = path.stat()
+            self.assertEqual((second.st_uid, second.st_gid), (first.st_uid, first.st_gid))
+            self.assertEqual(second.st_mode & 0o777, 0o644)
+            self.assertTrue(os.access(path, os.R_OK))
+
+    def test_privileged_atomic_write_uses_repository_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "state" / "self_heal" / "stability.json"
+            calls = []
+            real_fchown = os.fchown
+            with patch("trader.state.os.geteuid", return_value=0), patch(
+                    "trader.state.os.fchown",
+                    side_effect=lambda fd, uid, gid: (calls.append((uid, gid)), real_fchown(fd, uid, gid))[1]):
+                atomic_write_json(path, {"status": "BUILDING"}, ownership_source=root, mode=0o644)
+            owner = root.stat()
+            self.assertEqual(calls, [(owner.st_uid, owner.st_gid)])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+            self.assertEqual((path.parent.stat().st_uid, path.parent.stat().st_gid),
+                             (owner.st_uid, owner.st_gid))
 
 
 class SupervisorInstallTests(unittest.TestCase):

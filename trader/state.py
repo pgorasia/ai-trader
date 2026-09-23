@@ -277,8 +277,20 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def atomic_write_json(path: Path, data: Any) -> None:
+def atomic_write_json(path: Path, data: Any, *, ownership_source: Path | None = None,
+                      mode: int | None = None) -> None:
+    """Durably replace JSON, optionally inheriting an explicit ownership contract.
+
+    ``ownership_source`` is intended for privileged control-plane writers that
+    update repository-owned runtime state.  Unprivileged writers retain their
+    normal ownership; root applies the source uid/gid to the temporary inode
+    before it becomes visible at ``path``.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    if ownership_source is not None and hasattr(os, "geteuid") and os.geteuid() == 0:
+        owner = ownership_source.stat()
+        os.chown(path.parent, owner.st_uid, owner.st_gid)
+        os.chmod(path.parent, owner.st_mode & 0o777)
     try:
         encoded = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
     except (TypeError, ValueError) as exc:
@@ -286,6 +298,10 @@ def atomic_write_json(path: Path, data: Any) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temp_path = Path(temporary)
     try:
+        if mode is not None:
+            os.fchmod(fd, mode)
+        if ownership_source is not None and hasattr(os, "geteuid") and os.geteuid() == 0:
+            os.fchown(fd, owner.st_uid, owner.st_gid)
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(encoded); stream.flush(); os.fsync(stream.fileno())
         os.replace(temp_path, path)

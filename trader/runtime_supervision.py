@@ -51,7 +51,8 @@ def remediation_decision(*, service_inactive: bool, session_active: bool, accept
 
 def update_stability(path: Path, *, session: str, complete: bool, internal_defect: bool,
                      external_degradation: bool, recovery_correct: bool,
-                     repair_commit: str | None = None) -> dict[str, Any]:
+                     repair_commit: str | None = None,
+                     ownership_source: Path | None = None) -> dict[str, Any]:
     try:
         import json
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -85,5 +86,5 @@ def update_stability(path: Path, *, session: str, complete: bool, internal_defec
         value["last_clean_session"] = session
     if external_degradation: value["last_external_degradation"] = session
     value["status"] = "STABLE" if int(value["consecutive_clean_sessions"]) >= 3 else "BUILDING"
-    atomic_write_json(path, value)
+    atomic_write_json(path, value, ownership_source=ownership_source, mode=0o644)
     return value

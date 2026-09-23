@@ -23,6 +23,7 @@ REQUIRED_ACCEPTANCE_COUNTS = {"preflight": 5, "luna_schema": 5, "eod": 3}
 DEFAULT_HEARTBEAT_SECONDS = 60
 DEFAULT_MISSED_HEARTBEATS = 3
 DEFAULT_OPERATION_GRACE_SECONDS = 30
+OFF_HOURS_IDLE_LIFECYCLE_STATES = frozenset({"WAITING_FOR_NEXT_SESSION"})
 
 
 def _process_alive(pid: int) -> bool:
@@ -66,6 +67,17 @@ def _liveness(repo: Path, heartbeat: dict, latest_state: dict | None,
     return ("IDLE_HEALTHY" if age <= idle_deadline else "STALE_HEARTBEAT"), {
         "heartbeat_age_seconds": age, "idle_deadline_seconds": idle_deadline,
     }
+
+
+def _off_hours_idle_healthy(*, session_active: bool, heartbeat: dict,
+                            active_plans: list[dict], liveness: str,
+                            liveness_detail: dict) -> bool:
+    """Recognize only the daemon's canonical quiescent off-hours state."""
+    return (liveness == "STALE_HEARTBEAT"
+            and not session_active
+            and not active_plans
+            and "operation_id" not in liveness_detail
+            and heartbeat.get("lifecycle_state") in OFF_HOURS_IDLE_LIFECYCLE_STATES)
 
 
 def git_head(repo: Path) -> str | None:
@@ -133,17 +145,22 @@ def audit(repo: Path, state_dir: Path, journal_file: Path, *, now: datetime | No
     try:
         heartbeat = json.loads((state_dir / "heartbeat.json").read_text(encoding="utf-8"))
         liveness, liveness_detail = _liveness(repo, heartbeat, latest_state, observed)
-        if liveness == "STALE_HEARTBEAT":
+        active_plans = [] if latest_state is None else [
+            plan for plan in latest_state.get("shadow_plans", [])
+            if str(plan.get("outcome", {}).get("status", "")) in ({"PENDING"} | ENTERED_PERSISTED_STATES)
+        ]
+        if _off_hours_idle_healthy(session_active=session_active, heartbeat=heartbeat,
+                                   active_plans=active_plans, liveness=liveness,
+                                   liveness_detail=liveness_detail):
+            liveness = "IDLE_HEALTHY"
+            liveness_detail = {**liveness_detail, "off_hours_idle": True}
+        elif liveness == "STALE_HEARTBEAT":
             findings.append({"code": "SCHEDULER_SILENCE", "severity": "INTERNAL",
                              "detail": "heartbeat exceeded its configured liveness deadline"})
         elif liveness == "DEAD_PROCESS":
             findings.append({"code": "SERVICE_INACTIVE", "severity": "INTERNAL", "detail": "heartbeat PID is not alive"})
         if not heartbeat.get("lifecycle_state"):
             findings.append({"code": "SCHEDULER_REASON_MISSING", "severity": "INTERNAL", "detail": "heartbeat lacks lifecycle reason"})
-        active_plans = [] if latest_state is None else [
-            plan for plan in latest_state.get("shadow_plans", [])
-            if str(plan.get("outcome", {}).get("status", "")) in ({"PENDING"} | ENTERED_PERSISTED_STATES)
-        ]
         if active_plans and heartbeat.get("lifecycle_state") != "SESSION_RUNNING":
             findings.append({"code": "MONITOR_DISAPPEARANCE", "severity": "INTERNAL",
                              "detail": "active lifecycle plan lacks SESSION_RUNNING supervision"})
@@ -203,7 +220,8 @@ def main() -> int:
         latest = sorted(args.state_dir.glob("????-??-??.json"))[-1].stem
         update_stability(args.repo / "state/self_heal/stability.json", session=latest, complete=True,
             internal_defect=result["exit_code"] in {42, 43}, external_degradation=result["exit_code"] == 10,
-            recovery_correct=not any(x["code"] in {"SCHEDULER_SILENCE", "SERVICE_INACTIVE"} for x in result["findings"]))
+            recovery_correct=not any(x["code"] in {"SCHEDULER_SILENCE", "SERVICE_INACTIVE"} for x in result["findings"]),
+            ownership_source=args.repo / "state")
     atomic_write_json(args.output, result)
     return int(result["exit_code"])
 

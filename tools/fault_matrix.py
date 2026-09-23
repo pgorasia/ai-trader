@@ -20,6 +20,7 @@ from trader.lifecycle import (evaluate_entry_cutoff, evaluate_entry_trigger,
 from trader.state import atomic_write_json, initial_state
 from trader.runtime_supervision import classify_failure, remediation_decision
 from tools.runtime_supervisor import incident_fingerprint
+from tools.runtime_audit import _off_hours_idle_healthy
 
 NOW = datetime.fromisoformat("2026-08-14T10:00:00-04:00")
 
@@ -55,7 +56,8 @@ NAMES = [
  "malformed model output", "malformed OHLC", "stale quote", "duplicate finalist",
  "scheduler suppression with explicit reason", "scheduler suppression without reason",
  "internal NONE preserves live service", "accepted inactive service selects deterministic restart",
- "safety defect selects fail-closed repair", "unchanged supervisor incident fingerprint"]
+ "safety defect selects fail-closed repair", "unchanged supervisor incident fingerprint",
+ "off-hours waiting stale heartbeat is healthy", "off-hours active plan remains protected"]
 
 
 def named_case(index: int, name: str) -> dict:
@@ -168,6 +170,17 @@ def named_case(index: int, name: str) -> dict:
                 "remediation": {"action": "NONE"}, "findings": [{"code": "SCHEDULER_SILENCE"}]}
             passed = incident_fingerprint(incident) == incident_fingerprint(dict(incident))
             detail = "unchanged commit and evidence retain one repair fingerprint"
+        elif index == 44:
+            passed = _off_hours_idle_healthy(session_active=False,
+                heartbeat={"lifecycle_state": "WAITING_FOR_NEXT_SESSION"}, active_plans=[],
+                liveness="STALE_HEARTBEAT", liveness_detail={})
+            detail = "canonical off-hours idle state suppresses stale scheduler defect"
+        elif index == 45:
+            passed = not _off_hours_idle_healthy(session_active=False,
+                heartbeat={"lifecycle_state": "WAITING_FOR_NEXT_SESSION"},
+                active_plans=[{"outcome": {"status": "ENTERED"}}],
+                liveness="STALE_HEARTBEAT", liveness_detail={})
+            detail = "active off-hours lifecycle remains protected from idle exemption"
         elif index == 34:
             passed = evaluate_entry_trigger({**p, "entry_requires_qualitative_confirmation": True}, b) is None
             detail = "malformed or unresolved qualitative output cannot fabricate entry"

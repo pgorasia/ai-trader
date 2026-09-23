@@ -116,7 +116,7 @@ class FoundationReliabilityTests(unittest.TestCase):
         self.assertEqual(result["cases"], result["scenario_count"])
         self.assertEqual(result["failed"], len(result["failures"]))
         self.assertEqual(result["failed"], 0)
-        self.assertEqual(result["named_scenario_count"], 44)
+        self.assertEqual(result["named_scenario_count"], 46)
 
     def test_replay_reports_incomplete_input_without_fabricating(self):
         with tempfile.TemporaryDirectory() as directory:
