@@ -81,8 +81,14 @@ def _off_hours_idle_healthy(*, session_active: bool, heartbeat: dict,
 
 
 def git_head(repo: Path) -> str | None:
-    result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    resolved_repo = repo.resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-c", f"safe.directory={resolved_repo}", "-C", str(resolved_repo),
+             "rev-parse", "--verify", "HEAD"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        return None
     return result.stdout.strip() if result.returncode == 0 else None
 
 
