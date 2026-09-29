@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -271,6 +273,50 @@ class SupervisorInstallTests(unittest.TestCase):
             self.assertIn(str(repo / "tools/runtime_supervisor.py"), wrapper)
             self.assertTrue(os.stat(installed[0]).st_mode & 0o100)
             self.assertIn("ExecStart=/usr/local/bin/ai-trader-supervisor-run", installed[1].read_text())
+
+    def test_generated_timer_is_recurring_without_installation_date(self):
+        repo = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            installed = install(repo, Path(directory), production_repo=repo,
+                                python=Path(sys.executable))
+            timer = installed[2].read_text()
+        self.assertIn("OnCalendar=*-*-* *:00/5:00", timer)
+        self.assertNotIn("OnActiveSec=", timer)
+        self.assertNotIn("OnBootSec=", timer)
+        self.assertIsNone(re.search(r"(?m)^OnCalendar=\d{4}-\d{2}-\d{2}", timer))
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("AccuracySec=20s", timer)
+
+    def test_timer_calendar_is_valid_and_repeats_every_five_minutes(self):
+        analyzer = shutil.which("systemd-analyze")
+        if analyzer is None:
+            self.skipTest("systemd-analyze is unavailable")
+        completed = subprocess.run(
+            [analyzer, "calendar", "--iterations=4", "*-*-* *:00/5:00"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        timestamps = re.findall(
+            r"(?:Next elapse|Iteration #\d+): \w{3} (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",
+            completed.stdout,
+        )
+        self.assertEqual(len(timestamps), 4, completed.stdout)
+        parsed = [datetime.strptime(value, "%Y-%m-%d %H:%M:%S") for value in timestamps]
+        self.assertTrue(all(later - earlier == timedelta(minutes=5)
+                            for earlier, later in zip(parsed, parsed[1:])))
+
+    def test_repeated_install_is_byte_identical_and_preserves_service_contract(self):
+        repo = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = install(repo, root, production_repo=repo, python=Path(sys.executable))
+            before = [path.read_bytes() for path in first]
+            second = install(repo, root, production_repo=repo, python=Path(sys.executable))
+            self.assertEqual([path.read_bytes() for path in second], before)
+            service = second[1].read_text()
+        self.assertIn("Type=oneshot", service)
+        self.assertIn("ExecStart=/usr/local/bin/ai-trader-supervisor-run", service)
+        self.assertEqual(service.count("ExecStart="), 1)
 
     def test_canonical_production_repo_cli_remains_supported(self):
         repo = Path(__file__).resolve().parents[1]

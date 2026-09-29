@@ -58,8 +58,13 @@ def validate_installation(installed: list[Path], *, production_repo: Path, pytho
     service_text = service.read_text(encoding="utf-8")
     if "ExecStart=/usr/local/bin/ai-trader-supervisor-run" not in service_text:
         raise RuntimeError("supervisor unit ExecStart does not name the installed runner")
-    if "Unit=ai-trader-supervisor.service" not in timer.read_text(encoding="utf-8"):
+    timer_text = timer.read_text(encoding="utf-8")
+    if "Unit=ai-trader-supervisor.service" not in timer_text:
         raise RuntimeError("supervisor timer does not target the generated service")
+    if "OnCalendar=*-*-* *:00/5:00" not in timer_text:
+        raise RuntimeError("supervisor timer does not define the recurring five-minute schedule")
+    if "Persistent=true" not in timer_text:
+        raise RuntimeError("supervisor timer does not explicitly enable downtime catch-up")
     if not python.is_file() or not os.access(python, os.X_OK):
         raise RuntimeError("supervisor interpreter is missing or not executable")
     if not (production_repo / "tools/runtime_supervisor.py").is_file():

@@ -2,8 +2,7 @@
 Description=Audit AI Trader every five minutes
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnCalendar=*-*-* *:00/5:00
 AccuracySec=20s
 Persistent=true
 Unit=ai-trader-supervisor.service
