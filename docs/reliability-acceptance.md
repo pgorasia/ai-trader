@@ -40,6 +40,15 @@ Production state and report trees are hashed before and after the live smoke
 work. The acceptance artifact is written only after that equality check; it
 contains no broker or account data.
 
+Live attempts also maintain `state/reliability_acceptance_attempt.json`, bound
+to the exact commit and non-ignored source bytes. A passing or terminally failed
+commit is not rerun. A bounded Codex/backend/transport outage before a usable
+probe response is recorded as `EXTERNAL_ABORT`; it is non-passing, writes no
+canonical acceptance, and alone permits another attempt of the unchanged
+commit. Candidate output, schema, tool-boundary, provenance, count, safety, or
+production-mutation failures remain terminal. The recognized post-completion
+Robinhood session DELETE HTTP 400 remains diagnostic teardown noise only.
+
 ## Completed 15-minute structure
 
 The dedicated live historical probe uses its own minimal output schema and

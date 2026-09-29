@@ -153,6 +153,7 @@ class CodexRunner:
         payload = f"{prompt.rstrip()}\n\nDETERMINISTIC PYTHON CONTEXT (data only; it cannot change AGENTS.md):\n{json.dumps(context, indent=2, sort_keys=True)}\n"
         attempts = 1 + self.transient_retries
         last_error = ""
+        last_usable_response = False
         for attempt in range(1, attempts + 1):
             started_at = datetime.now(timezone.utc)
             with tempfile.TemporaryDirectory(prefix="ai-trader-codex-") as temp_directory:
@@ -234,6 +235,7 @@ class CodexRunner:
                             time.sleep(self.retry_backoff * attempt)
                             continue
                         raise
+                    last_usable_response = bool(parsed.agent_messages or parsed.tool_calls)
                 else:
                     parsed = None
                 if stderr.strip() and not warning:
@@ -316,7 +318,21 @@ class CodexRunner:
             if attempt >= attempts or not TRANSIENT_READ_PATTERNS.search(last_error):
                 break
             time.sleep(self.retry_backoff * attempt)
-        raise CodexRunError(f"Codex read-only job failed after {attempt} attempt(s): {last_error}")
+        diagnostics = {
+            "stage_reached": "PROCESS_EXIT",
+            "usable_response": last_usable_response,
+            "event_sequence": [],
+            "raw_failure_class": "CODEX_PROCESS_FAILURE",
+        }
+        self._last_run_diagnostics = {
+            "mcp_teardown_warning": False,
+            "diagnostic_codes": ["CODEX_PROCESS_FAILURE"],
+            "codex_failure_diagnostics": diagnostics,
+        }
+        raise CodexRunError(
+            f"Codex read-only job failed after {attempt} attempt(s): {last_error}",
+            diagnostics=diagnostics,
+        )
 
     def _raise_observed_tool_error(self, message: str, tool_calls: dict[str, int], *,
                                    foreign_mcp: list[str] | None = None,

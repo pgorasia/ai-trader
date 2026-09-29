@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,7 +34,7 @@ from trader.reporting import cycle_markdown, eod_markdown, preflight_report_arti
 from trader.safety import FORBIDDEN_ROBINHOOD_TOOLS, cooldown_until, derive_preflight_identity, enforce_preflight_result, enforce_preflight_stage, load_config, normalize_tool_name, offline_preflight, validate_json, write_alert
 from trader.scheduler import SessionScheduler
 from trader.shadow_monitor import ShadowPlanMonitor, aggregate_completed_15m, validate_bar_series
-from trader.state import STRATEGY_VERSION, StateStore, initial_state
+from trader.state import STRATEGY_VERSION, StateStore, atomic_write_json, initial_state
 from trader.automation import DaemonSupervisor, Heartbeat, health_check
 from trader.job_contracts import JOB_TOOL_CONTRACTS, validate_job_contracts
 from trader.lifecycle import scheduler_decision
@@ -49,7 +50,19 @@ CONFIG_PATH = ROOT / "config" / "strategy.yaml"
 LOGGER = logging.getLogger("ai_trader")
 BASELINE_STRATEGY_SHA256 = "0f7872c6530cfcda472f09c4509822da9a8d09f6177243ab6b3b36ab4326c4bc"
 ACCEPTANCE_VERSION = 1
+LIVE_ACCEPTANCE_ATTEMPT_VERSION = 1
+LIVE_ACCEPTANCE_ATTEMPT_PATH = "state/reliability_acceptance_attempt.json"
 RELIABILITY_SCENARIOS = tuple(range(1, 1041))
+
+_EXTERNAL_ABORT_PATTERNS = re.compile(
+    r"(?:failed to (?:refresh|list) available models?.*(?:timeout|timed out)|"
+    r"(?:model (?:refresh|list)|codex backend|backend).*(?:http\s*)?(?:502|503|capacity unavailable)|"
+    r"(?:http\s*)?(?:502|503).*(?:backend|service unavailable|capacity)|"
+    r"(?:http\s*|status\s+)(?:502|503)\b|"
+    r"(?:transport|connection).*(?:failed|failure|refused|reset|aborted|unavailable)|"
+    r"(?:service unavailable|capacity unavailable))",
+    re.IGNORECASE,
+)
 
 
 def audit(event: str, **values: Any) -> None:
@@ -1446,6 +1459,129 @@ def _git_commit(root: Path = ROOT) -> str:
     return completed.stdout.strip()
 
 
+def _candidate_source_identity(root: Path = ROOT) -> str:
+    """Bind retry permission to HEAD and every non-ignored working-tree byte."""
+    head = _git_commit(root)
+    completed = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=root,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        timeout=10, shell=False,
+    )
+    if completed.returncode:
+        raise PreflightError("Cannot determine deployment source identity")
+    digest = hashlib.sha256(head.encode("ascii"))
+    for line in sorted(item for item in completed.stdout.splitlines() if item.strip()):
+        path_text = line[3:]
+        if " -> " in path_text:
+            path_text = path_text.split(" -> ", 1)[1]
+        if path_text in {LIVE_ACCEPTANCE_ATTEMPT_PATH, "state/reliability_acceptance.json"}:
+            continue
+        path = root / path_text
+        digest.update(line.encode("utf-8", errors="replace"))
+        if path.is_file():
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def _read_live_acceptance_attempt(root: Path) -> dict[str, Any] | None:
+    path = root / LIVE_ACCEPTANCE_ATTEMPT_PATH
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PreflightError("Live acceptance attempt state is invalid") from exc
+    if not isinstance(value, dict) or value.get("version") != LIVE_ACCEPTANCE_ATTEMPT_VERSION:
+        raise PreflightError("Live acceptance attempt state is invalid")
+    return value
+
+
+def _write_live_acceptance_attempt(root: Path, *, outcome: str, commit: str,
+                                   source_identity: str, reason: str | None = None,
+                                   production_modified: bool = False) -> dict[str, Any]:
+    record = {
+        "version": LIVE_ACCEPTANCE_ATTEMPT_VERSION,
+        "commit": commit,
+        "source_identity": source_identity,
+        "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "outcome": outcome,
+        "external_reason": reason if outcome == "EXTERNAL_ABORT" else None,
+        "canonical_acceptance_written": outcome == "PASS",
+        "production_modified": production_modified,
+    }
+    prior = _read_live_acceptance_attempt(root)
+    history = list(prior.get("history", [])) if prior else []
+    history.append(dict(record))
+    record["history"] = history
+    atomic_write_json(root / LIVE_ACCEPTANCE_ATTEMPT_PATH, record)
+    return record
+
+
+def _begin_live_acceptance_attempt(root: Path) -> tuple[str, str]:
+    commit = _git_commit(root)
+    source_identity = _candidate_source_identity(root)
+    canonical = root / "state/reliability_acceptance.json"
+    if canonical.exists():
+        try:
+            accepted = json.loads(canonical.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            accepted = None
+        if isinstance(accepted, dict) and accepted.get("accepted_git_commit") == commit:
+            raise PreflightError("Live acceptance already passed for this commit")
+    previous = _read_live_acceptance_attempt(root)
+    if previous and previous.get("commit") == commit:
+        if previous.get("source_identity") != source_identity:
+            raise PreflightError("Live acceptance retry refused because candidate source changed without a new HEAD")
+        if previous.get("outcome") != "EXTERNAL_ABORT":
+            raise PreflightError("Live acceptance already reached a non-repeatable conclusion for this commit")
+    _write_live_acceptance_attempt(root, outcome="IN_PROGRESS", commit=commit,
+                                   source_identity=source_identity)
+    return commit, source_identity
+
+
+def _external_abort_reason(error: BaseException) -> str | None:
+    """Return a bounded external reason only before any usable response exists."""
+    if not isinstance(error, CodexRunError):
+        return None
+    diagnostics = error.diagnostics if isinstance(error.diagnostics, dict) else {}
+    if diagnostics.get("usable_response") is True:
+        return None
+    sequence = diagnostics.get("event_sequence")
+    if isinstance(sequence, list):
+        for event in sequence:
+            if not isinstance(event, dict):
+                continue
+            if event.get("event") == "agent_message":
+                return None
+            if event.get("event") == "tool.completed" and event.get("terminal_status") is None:
+                return None
+    summary = diagnostics.get("event_summary")
+    if isinstance(summary, dict) and int(summary.get("agent_message_count", 0) or 0) > 0:
+        return None
+    if int(diagnostics.get("agent_message_count", 0) or 0) > 0:
+        return None
+    if diagnostics.get("required_tool_validation_reached"):
+        return None
+    if isinstance(error, DataUnavailableError):
+        return "APPROVED_READ_ONLY_DATA_UNAVAILABLE_BEFORE_PROBE_CONCLUSION"
+    safe = sanitize_diagnostic_text(str(error))
+    match = _EXTERNAL_ABORT_PATTERNS.search(safe)
+    if not match:
+        structured = diagnostics.get("structured_error")
+        if isinstance(structured, dict):
+            if structured.get("http_status") in (502, 503, "502", "503"):
+                return "CODEX_BACKEND_UNAVAILABLE"
+            match = _EXTERNAL_ABORT_PATTERNS.search(sanitize_diagnostic_text(str(structured.get("message") or "")))
+    if not match:
+        return None
+    lowered = match.group(0).lower()
+    if "model" in lowered:
+        return "CODEX_MODEL_AVAILABILITY"
+    if "502" in lowered or "503" in lowered or "capacity" in lowered or "service unavailable" in lowered:
+        return "CODEX_BACKEND_UNAVAILABLE"
+    return "CODEX_TRANSPORT_UNAVAILABLE"
+
+
 def _strategy_freeze_result(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     strategy_hash = hashlib.sha256((root / "config/strategy.yaml").read_bytes()).hexdigest()
     write_prefixes = ("place_", "cancel_", "review_", "create_", "update_", "delete_", "submit_", "modify_")
@@ -1490,6 +1626,56 @@ def _acceptance_artifact(root: Path, live_counts: dict[str, int]) -> dict[str, A
             "strategy_version": STRATEGY_VERSION, "offline_gate": "PASS",
             "live_read_only_gate": "PASS", "live_run_counts": live_counts,
             "global_shadow_tool_count": len(APPROVED_SHADOW_ROBINHOOD_TOOLS)}
+
+
+def reliability_acceptance_live(root: Path, live_orchestrator: ShadowOrchestrator,
+                                session: str, *, preflight_runs: int,
+                                luna_schema_runs: int, eod_runs: int) -> dict[str, Any]:
+    """Run the commit-bound live gate and persist its explicit outcome."""
+    commit, source_identity = _begin_live_acceptance_attempt(root)
+    before = _production_snapshot(root)
+    passed = {"preflight": 0, "luna_schema": 0, "eod": 0}
+    try:
+        if _service_active("ai-trader.service"):
+            raise PreflightError("Live read-only acceptance refused because ai-trader.service is active")
+        if min(preflight_runs, luna_schema_runs, eod_runs) < 1:
+            raise PreflightError("Acceptance run counts must be positive")
+        offline = reliability_acceptance_offline(root)
+        if offline["status"] != "PASS":
+            raise PreflightError("Offline reliability gate did not pass")
+        for _ in range(preflight_runs):
+            live_orchestrator.smoke_preflight_acceptance(); passed["preflight"] += 1
+        for _ in range(luna_schema_runs):
+            live_orchestrator.smoke_luna_schema(session); passed["luna_schema"] += 1
+        for _ in range(eod_runs):
+            live_orchestrator.smoke_eod(session); passed["eod"] += 1
+        production_modified = _production_snapshot(root) != before
+        if production_modified:
+            raise StateCorruptionError("Acceptance modified production state or reports")
+        if _git_commit(root) != commit or _candidate_source_identity(root) != source_identity:
+            raise PreflightError("Candidate source changed during live acceptance")
+        counts = {"preflight": preflight_runs, "luna_schema": luna_schema_runs, "eod": eod_runs}
+        write_json_companion(root / "state/reliability_acceptance.json", _acceptance_artifact(root, counts))
+        _write_live_acceptance_attempt(root, outcome="PASS", commit=commit,
+                                       source_identity=source_identity)
+        return {"status": "PASS", "gate": "RELIABILITY_LIVE_READ_ONLY",
+                "preflight": {"passed": passed["preflight"], "requested": preflight_runs},
+                "luna_schema": {"passed": passed["luna_schema"], "requested": luna_schema_runs},
+                "eod": {"passed": passed["eod"], "requested": eod_runs},
+                "production_state_modified": False, "write_tools_exposed": False}
+    except (TraderError, OSError, ValueError) as exc:
+        production_modified = _production_snapshot(root) != before
+        reason = None if production_modified else _external_abort_reason(exc)
+        outcome = "EXTERNAL_ABORT" if reason else "TERMINAL_FAILURE"
+        _write_live_acceptance_attempt(root, outcome=outcome, commit=commit,
+                                       source_identity=source_identity, reason=reason,
+                                       production_modified=production_modified)
+        if outcome == "EXTERNAL_ABORT":
+            return {"status": "EXTERNAL_ABORT", "gate": "RELIABILITY_LIVE_READ_ONLY",
+                    "external_reason": reason, "retryable_same_commit": True,
+                    "canonical_acceptance_written": False,
+                    "production_state_modified": False}
+        raise
 
 
 def verify_deployment_accepted(root: Path = ROOT) -> None:
@@ -1564,27 +1750,12 @@ def main(argv: list[str] | None = None) -> int:
                 raise PreflightError("Smoke commands require SHADOW mode")
             orchestrator = ShadowOrchestrator()
             if args.reliability_acceptance_live:
-                if _service_active("ai-trader.service"):
-                    raise PreflightError("Live read-only acceptance refused because ai-trader.service is active")
-                if min(args.preflight_runs, args.luna_schema_runs, args.eod_runs) < 1:
-                    raise PreflightError("Acceptance run counts must be positive")
-                offline = reliability_acceptance_offline(ROOT)
-                if offline["status"] != "PASS":
-                    raise PreflightError("Offline reliability gate did not pass")
-                before = _production_snapshot(ROOT)
-                passed = {"preflight": 0, "luna_schema": 0, "eod": 0}
-                for _ in range(args.preflight_runs): orchestrator.smoke_preflight_acceptance(); passed["preflight"] += 1
-                for _ in range(args.luna_schema_runs): orchestrator.smoke_luna_schema(args.session); passed["luna_schema"] += 1
-                for _ in range(args.eod_runs): orchestrator.smoke_eod(args.session); passed["eod"] += 1
-                if _production_snapshot(ROOT) != before:
-                    raise StateCorruptionError("Acceptance modified production state or reports")
-                counts = {"preflight": args.preflight_runs, "luna_schema": args.luna_schema_runs, "eod": args.eod_runs}
-                write_json_companion(ROOT / "state/reliability_acceptance.json", _acceptance_artifact(ROOT, counts))
-                result = {"status": "PASS", "gate": "RELIABILITY_LIVE_READ_ONLY",
-                    "preflight": {"passed": passed["preflight"], "requested": args.preflight_runs},
-                    "luna_schema": {"passed": passed["luna_schema"], "requested": args.luna_schema_runs},
-                    "eod": {"passed": passed["eod"], "requested": args.eod_runs},
-                    "production_state_modified": False, "write_tools_exposed": False}
+                result = reliability_acceptance_live(
+                    ROOT, orchestrator, args.session,
+                    preflight_runs=args.preflight_runs,
+                    luna_schema_runs=args.luna_schema_runs,
+                    eod_runs=args.eod_runs,
+                )
             elif args.smoke_stage_b_replay:
                 result = orchestrator.smoke_stage_b_replay(args.session)
             elif args.smoke_luna_schema:
@@ -1594,7 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 result = orchestrator.smoke_preflight()
             print(json.dumps(result, indent=2))
-            return 0
+            return 0 if result.get("status") == "PASS" else 75
         except (TraderError, OSError, ValueError) as exc:
             print(f"FAIL CLOSED: {sanitize_diagnostic_text(str(exc))}", file=sys.stderr)
             return 2
