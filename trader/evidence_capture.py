@@ -12,7 +12,6 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = "point-in-time-evidence/v1"
-ACCEPTED_COMMIT = "656c6dabd64abb9e2a2f6859ed11ad1624b8ca50"
 FIDELITIES = frozenset({"EXACT", "SANITIZED_EXACT", "UNAVAILABLE"})
 _DROP = object()
 _SECRET_KEY = re.compile(
@@ -20,11 +19,27 @@ _SECRET_KEY = re.compile(
     r"session_(id|credential|token|secret)|mcp_(credential|token|secret))($|_)", re.I
 )
 _ACCOUNT_KEY = re.compile(
-    r"(^|_)(account_number|account_id|brokerage_account_id|holder|account_holder|customer_id|"
-    r"email|phone|address|ssn|tax_id)($|_)", re.I
+    r"(^|_)(account_number|rhs_account_number|rhc_account_number|account_id|brokerage_account_id|"
+    r"holder|account_holder|customer_id|email|phone|address|ssn|tax_id|date_of_birth|first_name|"
+    r"last_name)($|_)", re.I
+)
+_BROKER_ID_KEY = re.compile(
+    r"(^|_)(order_id|order_identifier|ref_id|instrument_id|instrument_identifier|instrument_url)($|_)", re.I
 )
 _SECRET_TEXT = re.compile(
-    r"(?i)(bearer\s+)[^\s,;\"']+|((?:access|refresh|session|oauth)[_ -]?token\s*[:=]\s*)[^\s,;]+"
+    r"(?i)(bearer\s+)[^\s,;\"']+|((?:(?:access|refresh|session|oauth)[_ -]?token|authorization|"
+    r"api[_ -]?key|password|passwd|cookie)\s*[:=]\s*)[^\s,;]+"
+)
+_SENSITIVE_IDENTIFIER_TEXT = re.compile(
+    r"(?i)(?:account[_ -]?number|rhs[_ -]?account[_ -]?number|rhc[_ -]?account[_ -]?number|"
+    r"order[_ -]?id|ref[_ -]?id|instrument[_ -]?(?:id|identifier|url))\s*[:=]"
+)
+_SERIALIZED_SENSITIVE_KEY = re.compile(
+    r'''(?i)(?:\\?["'])(?:account[_-]?number|rhs[_-]?account[_-]?number|rhc[_-]?account[_-]?number|'''
+    r'''account[_-]?holder|email|phone|address|ssn|tax[_-]?id|date[_-]?of[_-]?birth|first[_-]?name|'''
+    r'''last[_-]?name|authorization|access[_-]?token|refresh[_-]?token|api[_-]?key|password|passwd|'''
+    r'''cookie|set[_-]?cookie|order[_-]?id|ref[_-]?id|instrument[_-]?(?:id|identifier|url))'''
+    r'''(?:\\?["'])\s*:'''
 )
 
 
@@ -56,18 +71,26 @@ def sanitize(value: Any) -> tuple[Any, bool]:
     """Return a deterministic replay-safe projection and whether it changed."""
     changed = False
 
-    def walk(item: Any, key: str | None = None) -> Any:
+    def walk(item: Any, key: str | None = None, parent: Any = None) -> Any:
         nonlocal changed
         normalized_key = (re.sub(r"(?<!^)(?=[A-Z])", "_", key).replace("-", "_").lower()
                           if key is not None else None)
-        if normalized_key is not None and (_SECRET_KEY.search(normalized_key) or _ACCOUNT_KEY.search(normalized_key)):
+        if normalized_key is not None and (_SECRET_KEY.search(normalized_key) or
+                                            _ACCOUNT_KEY.search(normalized_key) or
+                                            _BROKER_ID_KEY.search(normalized_key)):
+            changed = True
+            return _DROP
+        if normalized_key == "instrument" and isinstance(parent, dict) and _is_broker_instrument(item, parent):
+            changed = True
+            return _DROP
+        if normalized_key == "id" and isinstance(parent, dict) and _looks_like_broker_order(parent):
             changed = True
             return _DROP
         if isinstance(item, dict):
             result: dict[str, Any] = {}
             for raw_key in sorted(item, key=lambda candidate: str(candidate)):
                 clean_key = str(raw_key)
-                projected = walk(item[raw_key], clean_key)
+                projected = walk(item[raw_key], clean_key, item)
                 if projected is not _DROP:
                     result[clean_key] = projected
             return result
@@ -79,8 +102,29 @@ def sanitize(value: Any) -> tuple[Any, bool]:
                     result.append(projected)
             return result
         if isinstance(item, str):
+            stripped = item.strip()
+            if stripped.startswith(("{", "[", '"')):
+                try:
+                    decoded = json.loads(item)
+                except (json.JSONDecodeError, TypeError):
+                    decoded = None
+                if isinstance(decoded, (dict, list)):
+                    nested = walk(decoded)
+                    if nested != decoded:
+                        changed = True
+                        return json.dumps(nested, ensure_ascii=False, sort_keys=True,
+                                          separators=(",", ":"), allow_nan=False)
+                elif isinstance(decoded, str) and decoded != item:
+                    nested = walk(decoded)
+                    if nested != decoded:
+                        changed = True
+                        return json.dumps(nested, ensure_ascii=False,
+                                          separators=(",", ":"), allow_nan=False)
             projected = _SECRET_TEXT.sub(lambda match: (match.group(1) or match.group(2) or "") + "<redacted>", item)
             changed |= projected != item
+            if _SERIALIZED_SENSITIVE_KEY.search(projected) or _SENSITIVE_IDENTIFIER_TEXT.search(projected):
+                changed = True
+                return "<redacted-sensitive-serialized-content>"
             return projected
         if item is None or isinstance(item, (bool, int, float)):
             return item
@@ -88,6 +132,72 @@ def sanitize(value: Any) -> tuple[Any, bool]:
         return str(item)
 
     return walk(deepcopy(value)), changed
+
+
+def _looks_like_broker_order(value: dict[Any, Any]) -> bool:
+    keys = {re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).replace("-", "_").lower()
+            for key in value}
+    return bool(keys & {"order_id", "ref_id", "instrument", "instrument_id", "account_number"}) or (
+        "id" in keys and "state" in keys and bool(keys & {"side", "quantity", "symbol", "type"})
+    )
+
+
+def _is_broker_instrument(value: Any, parent: dict[Any, Any]) -> bool:
+    text = value if isinstance(value, str) else ""
+    keys = {re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).replace("-", "_").lower()
+            for key in parent}
+    looks_identifier = bool(re.match(r"(?i)^https?://", text) or
+                            re.fullmatch(r"[0-9a-f]{8}-[0-9a-f-]{27,}", text))
+    return looks_identifier or bool(keys & {"order_id", "ref_id", "account_number"}) or (
+        "state" in keys and bool(keys & {"side", "quantity", "type"})
+    )
+
+
+def sensitive_findings(value: Any) -> list[str]:
+    """Scan parsed or serialized capture content for forbidden identifiers/secrets."""
+    findings: set[str] = set()
+
+    def walk(item: Any, key: str | None = None, parent: Any = None) -> None:
+        normalized = (re.sub(r"(?<!^)(?=[A-Z])", "_", key).replace("-", "_").lower()
+                      if key is not None else None)
+        if normalized and (_SECRET_KEY.search(normalized) or _ACCOUNT_KEY.search(normalized) or
+                           _BROKER_ID_KEY.search(normalized) or
+                           (normalized == "instrument" and isinstance(parent, dict) and _is_broker_instrument(item, parent)) or
+                           (normalized == "id" and isinstance(parent, dict) and _looks_like_broker_order(parent))):
+            findings.add(normalized)
+        if isinstance(item, dict):
+            for child_key, child in item.items():
+                walk(child, str(child_key), item)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                walk(child)
+        elif isinstance(item, str):
+            match = _SERIALIZED_SENSITIVE_KEY.search(item)
+            if match:
+                findings.add("serialized_sensitive_key")
+            if _SECRET_TEXT.search(item):
+                findings.add("secret_text")
+            if _SENSITIVE_IDENTIFIER_TEXT.search(item):
+                findings.add("sensitive_identifier_text")
+            try:
+                decoded = json.loads(item)
+            except (json.JSONDecodeError, TypeError):
+                return
+            if isinstance(decoded, (dict, list, str)) and decoded != item:
+                walk(decoded)
+
+    walk(value)
+    return sorted(findings)
+
+
+def _contains_semantic_redaction(value: Any) -> bool:
+    if value == "<redacted-sensitive-serialized-content>":
+        return True
+    if isinstance(value, dict):
+        return any(_contains_semantic_redaction(child) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_semantic_redaction(child) for child in value)
+    return False
 
 
 def render_model_input(prompt: str, context: dict[str, Any]) -> str:
@@ -127,12 +237,9 @@ def model_result_evidence(result: Any) -> dict[str, Any]:
 
 
 class EvidenceCapture:
-    def __init__(self, root: Path, *, enabled: bool = True,
-                 accepted_commit: str = ACCEPTED_COMMIT,
-                 clock=utc_now) -> None:
+    def __init__(self, root: Path, *, enabled: bool = True, clock=utc_now) -> None:
         self.root = Path(root)
         self.enabled = enabled
-        self.accepted_commit = accepted_commit
         self.clock = clock
         self.base = self.root / "state" / "replay_capture"
         self.objects = self.base / "objects"
@@ -145,6 +252,14 @@ class EvidenceCapture:
                 timeout=5,
             ).stdout.strip()
         except (OSError, subprocess.SubprocessError):
+            return "UNAVAILABLE"
+
+    def _accepted_commit(self) -> str:
+        try:
+            value = json.loads((self.root / "state" / "reliability_acceptance.json").read_text(encoding="utf-8"))
+            commit = value.get("accepted_git_commit")
+            return commit if isinstance(commit, str) and commit else "UNAVAILABLE"
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
             return "UNAVAILABLE"
 
     def record(self, *, session_date: str, operation_id: str, attempt: int,
@@ -161,7 +276,13 @@ class EvidenceCapture:
         if metadata:
             clean_metadata, metadata_changed = sanitize(metadata)
             changed |= metadata_changed
+        git_commit = self._git_head()
+        accepted_commit = self._accepted_commit()
+        binding_valid = git_commit != "UNAVAILABLE" and git_commit == accepted_commit
         effective_fidelity = "SANITIZED_EXACT" if changed and fidelity == "EXACT" else fidelity
+        semantic_redaction = _contains_semantic_redaction(projected) or _contains_semantic_redaction(clean_metadata)
+        if (not binding_valid or semantic_redaction) and effective_fidelity in {"EXACT", "SANITIZED_EXACT"}:
+            effective_fidelity = "UNAVAILABLE"
         content = {
             "schema_version": SCHEMA_VERSION,
             "fidelity": effective_fidelity,
@@ -181,9 +302,15 @@ class EvidenceCapture:
             "event_kind": event_kind,
             "fidelity": effective_fidelity,
             "content_digest": f"sha256:{digest}",
-            "git_commit": self._git_head(),
-            "accepted_commit": self.accepted_commit,
+            "git_commit": git_commit,
+            "accepted_commit": accepted_commit,
+            "binding_status": "MATCH" if binding_valid else "MISMATCH",
+            "exact_replay_eligible": binding_valid and effective_fidelity != "UNAVAILABLE",
         }
+        if effective_fidelity == "UNAVAILABLE":
+            event["unavailable_reason"] = ("BINDING_MISMATCH" if not binding_valid else
+                                           "SEMANTIC_REDACTION" if semantic_redaction else
+                                           "CONTRACTUAL")
         self._append(session_date, canonical_bytes(event) + b"\n")
         return event
 
@@ -246,14 +373,38 @@ class EvidenceCapture:
         missing = sorted(set(required) - kinds)
         failures = [event for event in events if event.get("event_kind") == "capture_exception"]
         invalid = [event.get("content_digest") for event in events if not self.verify(event)]
-        if failures:
+        binding_mismatches = [event.get("content_digest") for event in events
+                              if event.get("git_commit") != event.get("accepted_commit")]
+        secret_scan_failures = []
+        unavailable = sorted({event.get("event_kind") for event in events
+                              if event.get("fidelity") == "UNAVAILABLE"})
+        unexpected_unavailable = [event.get("content_digest") for event in events
+                                  if event.get("fidelity") == "UNAVAILABLE" and
+                                  event.get("unavailable_reason") != "CONTRACTUAL"]
+        for event in events:
+            if not self.verify(event):
+                continue
+            digest = str(event.get("content_digest", "")).removeprefix("sha256:")
+            path = self.objects / f"{digest}.json"
+            if path.is_file():
+                try:
+                    findings = sensitive_findings(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    findings = ["unscannable_object"]
+                if findings:
+                    secret_scan_failures.append(event.get("content_digest"))
+        if failures or binding_mismatches or secret_scan_failures:
             status = "DEGRADED"
-        elif missing or invalid:
+        elif missing or invalid or unexpected_unavailable:
             status = "INCOMPLETE"
         else:
             status = "COMPLETE"
         return {"status": status, "missing_categories": missing,
-                "capture_exceptions": len(failures), "invalid_objects": invalid}
+                "capture_exceptions": len(failures), "invalid_objects": invalid,
+                "binding_mismatches": binding_mismatches,
+                "secret_scan_failures": secret_scan_failures,
+                "unavailable_categories": unavailable,
+                "unexpected_unavailable": unexpected_unavailable}
 
 
 class SafeEvidenceCapture:
@@ -288,7 +439,9 @@ class SafeEvidenceCapture:
             self.failures.append({"event_kind": "session_completeness",
                                   "error_class": type(exc).__name__})
             return {"status": "DEGRADED", "missing_categories": sorted(set(required)),
-                    "capture_exceptions": len(self.failures), "invalid_objects": []}
+                    "capture_exceptions": len(self.failures), "invalid_objects": [],
+                    "binding_mismatches": [], "secret_scan_failures": [],
+                    "unavailable_categories": [], "unexpected_unavailable": []}
         if self.failures:
             result["status"] = "DEGRADED"
             result["capture_exceptions"] = max(result["capture_exceptions"], len(self.failures))

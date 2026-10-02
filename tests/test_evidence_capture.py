@@ -9,18 +9,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from trader.evidence_capture import (ACCEPTED_COMMIT, EvidenceCapture,
+from trader.evidence_capture import (EvidenceCapture,
     EvidenceCaptureError, SafeEvidenceCapture, canonical_bytes,
-    render_model_input, sanitize)
+    render_model_input, sanitize, sensitive_findings)
 from trader.shadow_monitor import ShadowPlanMonitor
 
 
 NOW = datetime(2026, 10, 2, 14, 0, tzinfo=timezone.utc)
+ACCEPTED_COMMIT = "c" * 40
 
 
 class EvidenceCaptureTests(unittest.TestCase):
     def capture(self, root: Path, enabled: bool = True) -> EvidenceCapture:
-        return EvidenceCapture(root, enabled=enabled, clock=lambda: NOW)
+        state = root / "state"; state.mkdir(parents=True, exist_ok=True)
+        (state / "reliability_acceptance.json").write_text(
+            json.dumps({"accepted_git_commit": ACCEPTED_COMMIT}), encoding="utf-8")
+        capture = EvidenceCapture(root, enabled=enabled, clock=lambda: NOW)
+        capture._git_head = lambda: ACCEPTED_COMMIT
+        return capture
 
     def record(self, capture: EvidenceCapture, payload=None, **kwargs):
         return capture.record(session_date="2026-10-02", operation_id="stage_b:1",
@@ -149,7 +155,10 @@ class EvidenceCaptureTests(unittest.TestCase):
 
     def test_capture_makes_no_requests(self):
         with tempfile.TemporaryDirectory() as directory:
-            capture = self.capture(Path(directory))
+            root = Path(directory); (root / "state").mkdir()
+            (root / "state" / "reliability_acceptance.json").write_text(
+                json.dumps({"accepted_git_commit": ACCEPTED_COMMIT}), encoding="utf-8")
+            capture = EvidenceCapture(root, clock=lambda: NOW)
             with patch("trader.evidence_capture.subprocess.run") as git:
                 git.return_value.stdout = ACCEPTED_COMMIT + "\n"
                 self.record(capture)
@@ -162,6 +171,108 @@ class EvidenceCaptureTests(unittest.TestCase):
             with patch.object(capture, "_git_head", return_value="head"):
                 event = self.record(capture)
             self.assertEqual((event["git_commit"], event["accepted_commit"]), ("head", ACCEPTED_COMMIT))
+
+    def test_accepted_commit_is_resolved_per_record_after_deployment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); state = root / "state"; state.mkdir()
+            parent = "a" * 40; child = "b" * 40
+            (state / "reliability_acceptance.json").write_text(
+                json.dumps({"accepted_git_commit": parent}), encoding="utf-8")
+            capture = EvidenceCapture(root, clock=lambda: NOW)
+            with patch.object(capture, "_git_head", return_value=parent):
+                self.assertEqual(self.record(capture)["accepted_commit"], parent)
+            (state / "reliability_acceptance.json").write_text(
+                json.dumps({"accepted_git_commit": child}), encoding="utf-8")
+            with patch.object(capture, "_git_head", return_value=child):
+                event = self.record(capture)
+            self.assertEqual((event["git_commit"], event["accepted_commit"]), (child, child))
+
+    def test_binding_mismatch_is_unavailable_and_degraded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "state").mkdir()
+            (root / "state" / "reliability_acceptance.json").write_text(
+                json.dumps({"accepted_git_commit": "a" * 40}), encoding="utf-8")
+            capture = EvidenceCapture(root, clock=lambda: NOW)
+            with patch.object(capture, "_git_head", return_value="b" * 40):
+                event = self.record(capture)
+            self.assertEqual(event["fidelity"], "UNAVAILABLE")
+            self.assertFalse(event["exact_replay_eligible"])
+            self.assertEqual(capture.completeness("2026-10-02", {"model_response"})["status"], "DEGRADED")
+
+    def test_serialized_and_nested_tool_content_is_sanitized(self):
+        raw = {"content": [{"text": json.dumps({"account_number": "123456", "close": 17.25,
+                "rhs_account_number": "rhs", "rhc_account_number": "rhc",
+                "order_id": "order-real", "ref_id": "ref-real",
+                "instrument_id": "instrument-real", "authorization": "Bearer token"})}]}
+        original = deepcopy(raw)
+        projected, changed = sanitize(raw)
+        self.assertTrue(changed); self.assertEqual(raw, original)
+        encoded = json.dumps(projected)
+        for secret in ("123456", "rhs", "rhc", "order-real", "ref-real", "instrument-real", "token"):
+            self.assertNotIn(secret, encoded)
+        self.assertIn("17.25", encoded)
+        self.assertEqual(sensitive_findings(projected), [])
+
+    def test_secret_scanner_detects_plain_and_escaped_sensitive_keys(self):
+        self.assertTrue(sensitive_findings({"account_number": "123"}))
+        self.assertTrue(sensitive_findings(r'{\"account_number\":\"123456\"}'))
+
+    def test_tokens_cookies_and_passwords_in_serialized_content_are_redacted(self):
+        raw = json.dumps({"access_token": "access-secret", "refresh_token": "refresh-secret",
+                          "cookie": "session-secret", "api_key": "api-secret",
+                          "password": "password-secret", "close": 10.25})
+        projected, changed = sanitize(raw)
+        self.assertTrue(changed); self.assertIn("10.25", projected)
+        for secret in ("access-secret", "refresh-secret", "session-secret", "api-secret", "password-secret"):
+            self.assertNotIn(secret, projected)
+
+    def test_safe_market_data_json_string_remains_byte_exact(self):
+        value = '{"symbol":"AAPL","instrument":"AAPL","close":225.5,"volume":1000}'
+        self.assertEqual(sanitize(value), (value, False))
+
+    def test_unparseable_sensitive_serialized_string_is_redacted(self):
+        projected, changed = sanitize('prefix {"account_number":"123"} suffix')
+        self.assertTrue(changed); self.assertEqual(projected, "<redacted-sensitive-serialized-content>")
+
+    def test_semantically_unsafe_whole_string_redaction_is_not_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            event = self.record(self.capture(Path(directory)),
+                                'prefix {"account_number":"123"} suffix')
+            self.assertEqual(event["fidelity"], "UNAVAILABLE")
+            self.assertFalse(event["exact_replay_eligible"])
+
+    def test_friday_style_model_response_has_no_brokerage_identifiers(self):
+        fixture = {"events": [{"item": {"type": "mcp_tool_call", "structured_content":
+            {"symbol": "AAPL", "account_number": "structured-secret"}, "content": [{"text":
+            '{"account_number":"text-secret","order":{"id":"order-secret","state":"filled",'
+            '"side":"buy","instrument":"instrument-secret"},"price":10.5}'}]}}]}
+        projected, _ = sanitize(fixture)
+        encoded = json.dumps(projected)
+        for secret in ("structured-secret", "text-secret", "order-secret", "instrument-secret"):
+            self.assertNotIn(secret, encoded)
+        self.assertFalse(sensitive_findings(projected))
+
+    def test_completeness_refuses_secret_scan_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = self.capture(Path(directory)); event = self.record(capture)
+            digest = event["content_digest"].split(":", 1)[1]
+            unsafe = canonical_bytes({"account_number": "leaked"})
+            unsafe_digest = hashlib.sha256(unsafe).hexdigest()
+            (capture.objects / f"{unsafe_digest}.json").write_bytes(unsafe)
+            manifest = capture.base / "sessions" / "2026-10-02" / "manifest.jsonl"
+            row = json.loads(manifest.read_text().splitlines()[0]); row["content_digest"] = f"sha256:{unsafe_digest}"
+            manifest.write_text(json.dumps(row) + "\n")
+            result = capture.completeness("2026-10-02", {"model_response"})
+            self.assertEqual(result["status"], "DEGRADED"); self.assertTrue(result["secret_scan_failures"])
+
+    def test_completeness_refuses_object_digest_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = self.capture(Path(directory)); event = self.record(capture)
+            digest = event["content_digest"].split(":", 1)[1]
+            (capture.objects / f"{digest}.json").write_bytes(b"tampered")
+            result = capture.completeness("2026-10-02", {"model_response"})
+            self.assertEqual(result["status"], "INCOMPLETE")
+            self.assertEqual(result["invalid_objects"], [event["content_digest"]])
 
     def test_complete_requires_all_categories_or_explicit_unavailable(self):
         with tempfile.TemporaryDirectory() as directory:
