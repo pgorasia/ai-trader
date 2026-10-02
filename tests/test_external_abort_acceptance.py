@@ -12,6 +12,13 @@ from trader.models import CodexRunError, PreflightError, SchemaValidationError, 
 
 COMMIT = "a" * 40
 SOURCE = "b" * 64
+WEBSOCKET_503 = """2026-10-02T04:15:38Z
+codex_api::endpoint::responses_websocket:
+failed to connect to websocket:
+HTTP error: 503 Service Unavailable,
+url: wss://chatgpt.com/backend-api/codex/responses"""
+DELETE_400 = """rmcp::transport::streamable_http_client:
+DELETE returned HTTP 400"""
 
 
 class ExternalAbortAcceptanceTests(unittest.TestCase):
@@ -45,6 +52,27 @@ class ExternalAbortAcceptanceTests(unittest.TestCase):
     def test_backend_502_before_response_is_external_abort(self):
         error = CodexRunError("Codex backend HTTP 502", diagnostics={"event_sequence": []})
         self.assertEqual(orchestrator._external_abort_reason(error), "CODEX_BACKEND_UNAVAILABLE")
+
+    def test_exact_responses_websocket_503_is_external_abort(self):
+        error = CodexRunError(WEBSOCKET_503, diagnostics={"event_sequence": []})
+        self.assertEqual(orchestrator._external_abort_reason(error), "CODEX_BACKEND_UNAVAILABLE")
+
+    def test_responses_websocket_backend_502_is_external_abort(self):
+        message = WEBSOCKET_503.replace("503 Service Unavailable", "502 Bad Gateway")
+        error = CodexRunError(message, diagnostics={"event_sequence": []})
+        self.assertEqual(orchestrator._external_abort_reason(error), "CODEX_BACKEND_UNAVAILABLE")
+
+    def test_websocket_503_with_delete_400_remains_external_abort(self):
+        error = CodexRunError(f"{WEBSOCKET_503}\n{DELETE_400}", diagnostics={"event_sequence": []})
+        self.assertEqual(orchestrator._external_abort_reason(error), "CODEX_BACKEND_UNAVAILABLE")
+
+    def test_websocket_503_after_usable_response_is_terminal(self):
+        error = CodexRunError(WEBSOCKET_503, diagnostics={
+            "usable_response": True,
+            "event_sequence": [{"event": "agent_message.completed"}],
+            "agent_message_count": 1,
+        })
+        self.assertIsNone(orchestrator._external_abort_reason(error))
 
     def test_teardown_400_alone_never_classifies_external(self):
         error = CodexRunError("DELETE returned HTTP 400 session teardown")
@@ -101,10 +129,24 @@ class ExternalAbortAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = self.root(directory); core = Mock()
             core.smoke_preflight_acceptance.side_effect = [
-                CodexRunError("Codex backend HTTP 503"), None]
+                CodexRunError(WEBSOCKET_503, diagnostics={"event_sequence": []}), None]
             self.assertEqual(self.run_gate(root, core)["status"], "EXTERNAL_ABORT")
             self.assertEqual(self.run_gate(root, core)["status"], "PASS")
             self.assertEqual(core.smoke_preflight_acceptance.call_count, 2)
+
+    def test_websocket_503_attempt_has_reason_and_no_canonical_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.root(directory); core = Mock()
+            core.smoke_preflight_acceptance.side_effect = CodexRunError(
+                f"{WEBSOCKET_503}\n{DELETE_400}", diagnostics={"event_sequence": []})
+            result = self.run_gate(root, core)
+            record = json.loads((root / orchestrator.LIVE_ACCEPTANCE_ATTEMPT_PATH).read_text())
+            self.assertEqual(result["status"], "EXTERNAL_ABORT")
+            self.assertEqual(result["external_reason"], "CODEX_BACKEND_UNAVAILABLE")
+            self.assertEqual(record["external_reason"], "CODEX_BACKEND_UNAVAILABLE")
+            self.assertFalse(record["canonical_acceptance_written"])
+            self.assertFalse(record["production_modified"])
+            self.assertFalse((root / "state/reliability_acceptance.json").exists())
 
     def test_source_change_invalidates_retry_entitlement(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -65,6 +65,11 @@ _EXTERNAL_ABORT_PATTERNS = re.compile(
     r"(?:service unavailable|capacity unavailable))",
     re.IGNORECASE,
 )
+_RESPONSES_WEBSOCKET_BACKEND_UNAVAILABLE = re.compile(
+    r"(?:codex_api::endpoint::responses_websocket|backend-api/codex/responses)"
+    r"[\s\S]{0,500}?(?:http\s+(?:error\s*:\s*)?|status\s+)(?:502|503)\b",
+    re.IGNORECASE,
+)
 
 
 def audit(event: str, **values: Any) -> None:
@@ -1676,13 +1681,22 @@ def _external_abort_reason(error: BaseException) -> str | None:
     if isinstance(error, DataUnavailableError):
         return "APPROVED_READ_ONLY_DATA_UNAVAILABLE_BEFORE_PROBE_CONCLUSION"
     safe = sanitize_diagnostic_text(str(error))
+    structured = diagnostics.get("structured_error")
+    structured_message = ""
+    if isinstance(structured, dict):
+        structured_message = sanitize_diagnostic_text(str(structured.get("message") or ""))
+    # Codex emits this transport failure in more than one textual form.  Keep
+    # it narrowly tied to the responses websocket/backend endpoint and only
+    # evaluate it after the usable-response and validation guards above.
+    websocket_diagnostic = "\n".join(part for part in (safe, structured_message) if part)
+    if _RESPONSES_WEBSOCKET_BACKEND_UNAVAILABLE.search(websocket_diagnostic):
+        return "CODEX_BACKEND_UNAVAILABLE"
     match = _EXTERNAL_ABORT_PATTERNS.search(safe)
     if not match:
-        structured = diagnostics.get("structured_error")
         if isinstance(structured, dict):
             if structured.get("http_status") in (502, 503, "502", "503"):
                 return "CODEX_BACKEND_UNAVAILABLE"
-            match = _EXTERNAL_ABORT_PATTERNS.search(sanitize_diagnostic_text(str(structured.get("message") or "")))
+            match = _EXTERNAL_ABORT_PATTERNS.search(structured_message)
     if not match:
         return None
     lowered = match.group(0).lower()
