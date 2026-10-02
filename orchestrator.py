@@ -24,6 +24,8 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from trader.codex_runner import CodexRunner
+from trader.evidence_capture import (EvidenceCapture, SafeEvidenceCapture,
+    model_result_evidence, render_model_input)
 from trader.codex_events import sanitize_diagnostic_text
 from trader.clock import SystemClock, TrustedClock
 from trader.instance_lock import SingleInstanceLock
@@ -134,6 +136,17 @@ class ShadowOrchestrator:
         self.scheduler = SessionScheduler(self.config["schedule"])
         self.monitor = ShadowPlanMonitor()
         self.clock = clock or SystemClock()
+        capture_enabled = os.environ.get("AI_TRADER_EVIDENCE_CAPTURE", "1").strip().lower() not in {"0", "false", "off"}
+        self.evidence = SafeEvidenceCapture(EvidenceCapture(self.root, enabled=capture_enabled))
+
+    def _capture(self, state: dict[str, Any], operation_id: str, attempt: int,
+                 event_kind: str, payload: Any, *, fidelity: str = "EXACT",
+                 metadata: dict[str, Any] | None = None) -> None:
+        evidence = getattr(self, "evidence", None)
+        if evidence is not None:
+            evidence.record(session_date=state["session_date"], operation_id=operation_id,
+                            attempt=attempt, event_kind=event_kind, payload=payload,
+                            fidelity=fidelity, metadata=metadata)
 
     def _trusted_now(self) -> datetime:
         clock = getattr(self, "clock", None)
@@ -153,11 +166,53 @@ class ShadowOrchestrator:
         audit(f"{operation_type}_START" if operation_type != "STAGE_B" else "CYCLE_START",
               operation_id=operation_id, attempt=record["attempt_number"])
         self.store.save(state)
+        attempt = record["attempt_number"]
+        envelope = {
+            "session_date": state["session_date"], "operation_id": operation_id,
+            "operation_type": operation_type, "scheduled_for": scheduled_for.isoformat(),
+            "attempt": attempt, "started_at": record["started_at"],
+            "strategy_version": state.get("strategy_version", STRATEGY_VERSION), "mode": "SHADOW",
+        }
+        rendered_invocation = None
+        prompt_path = runner_args.get("prompt_path")
+        context = runner_args.get("context")
+        if isinstance(prompt_path, Path) and isinstance(context, dict):
+            try:
+                rendered = render_model_input(prompt_path.read_text(encoding="utf-8"), context)
+                rendered_invocation = {
+                    "rendered_input": rendered,
+                    "model": runner_args.get("model"),
+                    "reasoning_effort": runner_args.get("reasoning_effort"),
+                    "allow_web": bool(runner_args.get("allow_web", False)),
+                    "required_robinhood_tools": sorted(runner_args.get("required_robinhood_tools", [])),
+                }
+            except (OSError, UnicodeError) as exc:
+                self._capture(state, operation_id, attempt, "capture_exception",
+                              {"category": "model_invocation", "error_class": type(exc).__name__},
+                              fidelity="SANITIZED_EXACT")
+        response_evidence = None
         try:
             result = self.runner.run(**runner_args)
+            response_evidence = model_result_evidence(result)
             if result_validator is not None:
                 result_validator(result)
+            self._capture(state, operation_id, attempt, "operation_started", envelope)
+            if rendered_invocation is not None:
+                self._capture(state, operation_id, attempt, "model_invocation", rendered_invocation)
+            self._capture(state, operation_id, attempt, "model_response", response_evidence)
+            self._capture(state, operation_id, attempt, "deterministic_validation", {
+                "schema_validation": "PASS", "semantic_validation": "PASS",
+                "validated_output": response_evidence["normalized_output"],
+            })
         except TraderError as exc:
+            self._capture(state, operation_id, attempt, "operation_started", envelope)
+            if rendered_invocation is not None:
+                self._capture(state, operation_id, attempt, "model_invocation", rendered_invocation)
+            if response_evidence is not None:
+                self._capture(state, operation_id, attempt, "model_response", response_evidence)
+            self._capture(state, operation_id, attempt, "operation_failed", {
+                "error_class": type(exc).__name__, "message": sanitize_diagnostic_text(str(exc)),
+            }, fidelity="SANITIZED_EXACT")
             ended = self._trusted_now(); counts["codex_failed_attempts"] = counts.get("codex_failed_attempts", 0) + 1
             if operation_type == "EOD": counts["eod_failed_attempts"] = counts.get("eod_failed_attempts", 0) + 1
             if operation_type == "STAGE_B": counts["stage_b_failed_slots"] = counts.get("stage_b_failed_slots", 0) + 1
@@ -175,12 +230,15 @@ class ShadowOrchestrator:
             audit("CYCLE_FAILED" if operation_type == "STAGE_B" else f"{operation_type}_FAILED",
                   operation_id=operation_id, error_class=type(exc).__name__, decision=decision)
             raise
-        complete_operation(record, self._trusted_now()); record_ai_success(state)
+        completed_at = self._trusted_now()
+        complete_operation(record, completed_at); record_ai_success(state)
         if operation_type == "STAGE_B": counts["stage_b_completed_runs"] = counts.get("stage_b_completed_runs", 0) + 1
         elif operation_type == "SOL": counts["sol_completed_runs"] = counts.get("sol_completed_runs", 0) + 1
         elif operation_type == "MONITOR": counts["monitor_completed_runs"] = counts.get("monitor_completed_runs", 0) + 1
         elif operation_type == "EOD": counts["eod_completed_runs"] = counts.get("eod_completed_runs", 0) + 1
         self.store.save(state)
+        self._capture(state, operation_id, attempt, "operation_completed",
+                      {**envelope, "ended_at": completed_at.isoformat(), "status": "COMPLETED"})
         return result
 
     def preflight(self, state: dict[str, Any], now: datetime, *, operation_id: str | None = None) -> dict[str, Any]:
@@ -269,6 +327,24 @@ class ShadowOrchestrator:
                 if child.web_searches: raise PreflightError(f"{stage} preflight stage unexpectedly used web search")
                 enforce_preflight_stage(stage, child.data)
                 summary["status"] = "PASS"
+                try:
+                    preflight_input = render_model_input(
+                        (self.root / "prompts" / prompt_name).read_text(encoding="utf-8"), context)
+                except (OSError, UnicodeError) as exc:
+                    self._capture(working, operation_id, 1, "capture_exception",
+                                  {"category": "preflight_observation", "error_class": type(exc).__name__},
+                                  fidelity="SANITIZED_EXACT")
+                else:
+                    child_evidence = model_result_evidence(child)
+                    self._capture(working, operation_id, 1, "preflight_observation", {
+                        "stage": stage, "rendered_input": preflight_input,
+                        "model": self.config["models"]["luna"],
+                        "structured_output": child_evidence["structured_output"],
+                        "validated_output": child_evidence["normalized_output"],
+                        "events": child_evidence["events"],
+                        "tool_calls": child_evidence["tool_calls"],
+                        "usage": child_evidence["usage"],
+                    })
             enforce_preflight_result(result)
         except TraderError as exc:
             for child in job_results: self._add_usage(working, child)
@@ -394,6 +470,13 @@ class ShadowOrchestrator:
         cycle["cli_usage"] = result.usage
         cycle["cli_tool_calls"] = result.tool_calls
         cycle["cli_diagnostics"] = result.diagnostics
+        capture_attempt = (find_operation(state, f"stage_b:{scheduled_for.isoformat()}") or {}).get("attempt_number", 1)
+        self._capture(state, f"stage_b:{scheduled_for.isoformat()}", capture_attempt,
+                      "scanner_and_finalists", cycle,
+                      metadata={"ordering": "AS_CONSUMED", "scanner": cycle.get("scanner")})
+        self._capture(state, f"stage_b:{scheduled_for.isoformat()}", capture_attempt,
+                      "full_scanner_universe", {"reason": "runtime_does_not_expose_full_universe"},
+                      fidelity="UNAVAILABLE")
         state["baseline_external_orders"] = [
             {"attribution": "BASELINE_EXTERNAL_ORDER", "symbol": item["symbol"], "side": item["side"], "state": item["state"]}
             for item in cycle["account_status"]["baseline_external_orders"]
@@ -510,6 +593,8 @@ class ShadowOrchestrator:
                 "cli_usage": result.usage, "cli_tool_calls": result.tool_calls, "cli_diagnostics": result.diagnostics,
             })
             state["senior_decisions"].append(decision)
+            sol_attempt = (find_operation(state, decision_operation) or {}).get("attempt_number", 1)
+            self._capture(state, decision_operation, sol_attempt, "senior_decision", decision)
             state["operation_ids"].append(decision_operation)
             state["usage_counts"]["sol_runs"] += 1
             self._add_usage(state, result)
@@ -531,6 +616,7 @@ class ShadowOrchestrator:
                 }
                 state["shadow_plans"].append(frozen)
                 state["operation_ids"].append(f"plan:{plan_id}")
+                self._capture(state, decision_operation, sol_attempt, "shadow_plan_created", frozen)
             self.store.save(state)
             number = len(state["senior_decisions"])
             write_non_destructive_text(self.root / "reports" / f"{state['session_date']}-senior-{number}.md", senior_markdown(decision))
@@ -609,6 +695,11 @@ class ShadowOrchestrator:
                 raise CodexRunError(f"Shadow monitor omitted bars for {symbol}")
             updated = self.monitor.evaluate(plan, result.data["symbol_bars"][symbol], now)
             updated_by_id[plan["plan_id"]] = self.monitor.evaluate_trailing(updated, result.data["symbol_bars"][symbol], now)
+        monitor_attempt = (find_operation(state, monitor_operation) or {}).get("attempt_number", 1)
+        self._capture(state, monitor_operation, monitor_attempt, "monitoring_lifecycle", {
+            "as_of": now.isoformat(), "symbol_bars": result.data["symbol_bars"],
+            "plans_before": active, "plans_after": list(updated_by_id.values()),
+        })
         state["shadow_plans"] = [updated_by_id.get(item["plan_id"], item) for item in state["shadow_plans"]]
         state["shadow_positions"] = [
             {"attribution": "SHADOW_AI", "plan_id": item["plan_id"], "symbol": item["original_plan"]["symbol"], "research_role": item.get("research_role", "PRIMARY"), "variant": variant, "entry_price": outcome["entry_price"], "entry_timestamp": outcome["entry_timestamp"]}
@@ -665,6 +756,22 @@ class ShadowOrchestrator:
         state["eod_review"] = review
         state["operation_ids"].append(eod_operation)
         self.store.save(state)
+        eod_attempt = (find_operation(state, eod_operation) or {}).get("attempt_number", 1)
+        self._capture(state, eod_operation, eod_attempt, "eod_finalization", {
+            "review": review, "shadow_plans": state["shadow_plans"],
+            "completed_shadow_trades": state["completed_shadow_trades"],
+        })
+        evidence = getattr(self, "evidence", None)
+        if evidence is not None:
+            required = {"operation_started", "model_invocation", "model_response",
+                        "deterministic_validation", "scanner_and_finalists",
+                        "full_scanner_universe", "eod_finalization"}
+            if state["senior_decisions"]:
+                required.add("senior_decision")
+            if state["shadow_plans"]:
+                required.add("shadow_plan_created")
+            completeness = evidence.completeness(state["session_date"], required)
+            self._capture(state, eod_operation, eod_attempt, "session_completeness", completeness)
         readiness = calculate_readiness(self.store.all_states(), self.config)
         state["readiness"] = readiness
         self.store.save(state)
@@ -728,6 +835,10 @@ class ShadowOrchestrator:
                   "metrics_retained": True,
                   "ai_eod_outcome": "FAILED_TERMINAL" if ai_failed else "NOT_COMPLETED"}
         complete_eod_recovery(state, self._trusted_now(), review)
+        self._capture(state, operation_id, int(record.get("attempt_number", 0)), "eod_finalization", {
+            "review": review, "shadow_plans": state["shadow_plans"],
+            "completed_shadow_trades": state["completed_shadow_trades"],
+        })
         self.store.save(state); audit("SESSION_COMPLETE", session=state["session_date"], eod=status)
         return {"session_date": state["session_date"], "agent_review": review,
                 "shadow_plans": state["shadow_plans"], "completed_shadow_trades": state["completed_shadow_trades"],

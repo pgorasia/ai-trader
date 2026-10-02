@@ -35,6 +35,7 @@ class LifecycleHardeningTests(unittest.TestCase):
         core.runner = Mock()
         core.runner.run.return_value = SimpleNamespace()
         core.runner.safe_diagnostics.return_value = {}
+        core.evidence = Mock()
         state = initial_state(now.date().isoformat(), core.config["timezone"], now)
 
         def reject(_observed):
@@ -50,6 +51,12 @@ class LifecycleHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(state["ai_operations"][0]["state"], "FAILED_TERMINAL")
+        model_response = next(
+            call.kwargs for call in core.evidence.record.call_args_list
+            if call.kwargs["event_kind"] == "model_response"
+        )
+        self.assertIsNone(model_response["payload"]["structured_output"])
+        self.assertIsNone(model_response["payload"]["normalized_output"])
 
     def test_senior_semantics_are_passed_as_precommit_validator(self):
         core = self.bare()
